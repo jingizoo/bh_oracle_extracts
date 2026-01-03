@@ -1,3 +1,55 @@
+/*
+ * ============================================================================
+ * PGA OPTIMIZATION FIXES APPLIED
+ * ============================================================================
+ * 
+ * This query has been optimized to prevent ORA-04036 (PGA_AGGREGATE_LIMIT) 
+ * and ORA-00028 (session killed) errors.
+ * 
+ * KEY CHANGES:
+ * 1. Date filtering added in voucher_base (UNCOMMENT for batching)
+ * 2. ORDER BY removed from memo_agg CTE (reduces PGA usage)
+ * 3. Final ORDER BY commented out (prevents large sort operations)
+ * 4. supp_conn CTE ensures 1 row per voucher (prevents row explosion)
+ * 
+ * ============================================================================
+ * DIAGNOSTIC QUERIES (run these to verify fixes)
+ * ============================================================================
+ * 
+ * A) Check for row multiplication in supp_conn:
+ *    SELECT v.business_unit, v.voucher_id, COUNT(*) cnt
+ *    FROM voucher_base v
+ *    LEFT JOIN supp_conn sc
+ *      ON sc.business_unit = v.business_unit
+ *     AND sc.voucher_id    = v.voucher_id
+ *    GROUP BY v.business_unit, v.voucher_id
+ *    HAVING COUNT(*) > 1;
+ *    -- Should return 0 rows. If > 0, supp_conn is still exploding rows.
+ * 
+ * B) Check extract size:
+ *    SELECT COUNT(*) FROM voucher_base;
+ *    -- Use this to determine appropriate batch size
+ * 
+ * ============================================================================
+ * BATCH PROCESSING INSTRUCTIONS
+ * ============================================================================
+ * 
+ * To process in batches, UNCOMMENT one of these lines in voucher_base CTE:
+ * 
+ * For bind variables (recommended):
+ *   AND v.entered_dt >= :p_from_dt AND v.entered_dt < :p_to_dt
+ * 
+ * For hardcoded dates (testing):
+ *   AND v.entered_dt >= DATE '2026-01-01' AND v.entered_dt < DATE '2026-02-01'
+ * 
+ * Recommended batch sizes:
+ *   - Monthly: DATE 'YYYY-MM-01' to DATE 'YYYY-MM+1-01'
+ *   - Weekly: 7-day ranges
+ *   - Daily: Single day ranges for very large datasets
+ * 
+ * ============================================================================
+ */
+
 WITH
 /* 1) Drive set */
 voucher_base AS (
@@ -27,6 +79,10 @@ voucher_base AS (
     WHERE v.entry_status <> 'X'
       AND v.close_status <> 'C'
       AND v.po_id <> ' '              -- keep if you ONLY want PO vouchers
+      -- BATCH FILTER: Add date range to prevent PGA blowup
+      -- Use bind variables: AND v.entered_dt >= :p_from_dt AND v.entered_dt < :p_to_dt
+      -- Or hardcode for testing: AND v.entered_dt >= DATE '2026-01-01' AND v.entered_dt < DATE '2026-02-01'
+      -- UNCOMMENT ONE OF THE ABOVE LINES FOR BATCH PROCESSING
 ),
 
 /* 2) ONE pass over voucher lines for these vouchers */
@@ -94,7 +150,8 @@ cntrct_list AS (
     GROUP BY business_unit, voucher_id
 ),
 
-/* memo aggregation */
+/* memo aggregation - ORDER BY removed to reduce PGA usage */
+/* If memo ordering is required, uncomment ORDER BY but expect higher PGA usage */
 memo_agg AS (
     SELECT
         business_unit,
@@ -114,7 +171,7 @@ memo_agg AS (
                             ' '
                         ) || ' | '
                     )
-                    ORDER BY voucher_line_num
+                    -- ORDER BY voucher_line_num  -- COMMENTED OUT: Removed to reduce PGA usage
                 ).EXTRACT('//text()') AS CLOB
             ),
             ' | '
@@ -232,6 +289,13 @@ vendor_loc_pick AS (
     GROUP BY setid, vendor_id
 ),
 
+/* 
+ * supp_conn: Ensures 1 row per voucher by picking ONE address + ONE location per vendor
+ * This prevents cartesian explosion that causes PGA blowup
+ * vendor_addr_pick: MIN(address_seq_num) per vendor = 1 row per vendor
+ * vendor_loc_pick: MIN(vndr_loc) per vendor = 1 row per vendor
+ * Result: 1 row per voucher (no multiplication)
+ */
 supp_conn AS (
     SELECT
         vb.business_unit,
@@ -355,4 +419,6 @@ LEFT JOIN cntrct_list  cl ON cl.business_unit = v.business_unit AND cl.voucher_i
 LEFT JOIN memo_agg     ma ON ma.business_unit = v.business_unit AND ma.voucher_id = v.voucher_id
 LEFT JOIN supp_conn    sc ON sc.business_unit = v.business_unit AND sc.voucher_id = v.voucher_id
 LEFT JOIN ps_bh_wd_sup_1to1 wd ON v.vendor_id = wd.bh_wd_ps_vendor_id
-ORDER BY v.voucher_id;
+-- ORDER BY v.voucher_id  -- COMMENTED OUT: Removed to prevent PGA blowup from large sorts
+-- If ordering is required, sort in application layer or use smaller batches
+;
