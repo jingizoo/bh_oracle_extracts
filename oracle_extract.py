@@ -105,6 +105,13 @@ class OracleExtractor:
         # DuckDB supports longer identifiers, but keep it reasonable
         return name.lower()
 
+    def _duckdb_quote_ident(self, name: str) -> str:
+        n = (name or "").strip()
+        # If already quoted, assume caller knows what they're doing
+        if len(n) >= 2 and n.startswith('"') and n.endswith('"'):
+            return n
+        return '"' + n.replace('"', '""') + '"'
+
     def _sanitize_duckdb_column_name(self, col_name: str) -> str:
         """
         Convert a column name to a stable DuckDB identifier.
@@ -129,18 +136,23 @@ class OracleExtractor:
         This avoids type inference failures/drops and guarantees all rows load.
         """
         safe_table = self._sanitize_duckdb_table_name(table_name)
-        safe_cols = [self._sanitize_duckdb_column_name(c) for c in column_names]
+        cols: List[str] = []
+        for i, c in enumerate(column_names):
+            cols.append(c if c else f"col_{i+1}")
 
-        col_defs = ", ".join([f'"{c}" VARCHAR' for c in safe_cols])
+        col_defs = ", ".join([f"{self._duckdb_quote_ident(c)} VARCHAR" for c in cols])
         con.execute(f'CREATE OR REPLACE TABLE "{safe_table}" ({col_defs})')
         return safe_table
 
     def insert_rows_duckdb(self, con, table_name: str, column_names: List[str], rows: list) -> None:
         if not rows:
             return
-        safe_cols = [self._sanitize_duckdb_column_name(c) for c in column_names]
-        placeholders = ", ".join(["?"] * len(safe_cols))
-        col_list = ", ".join([f'"{c}"' for c in safe_cols])
+        cols: List[str] = []
+        for i, c in enumerate(column_names):
+            cols.append(c if c else f"col_{i+1}")
+
+        placeholders = ", ".join(["?"] * len(cols))
+        col_list = ", ".join([self._duckdb_quote_ident(c) for c in cols])
         con.executemany(
             f'INSERT INTO "{table_name}" ({col_list}) VALUES ({placeholders})',
             rows,
