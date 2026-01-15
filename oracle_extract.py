@@ -104,35 +104,46 @@ class OracleExtractor:
         # DuckDB supports longer identifiers, but keep it reasonable
         return name.lower()
 
-    def persist_csv_to_duckdb(self, duckdb_path: str, table_name: str, csv_path: str,
-                              delimiter: str = ',', skip_rows: int = 0) -> tuple[str, int]:
+    def _sanitize_duckdb_column_name(self, col_name: str) -> str:
         """
-        Create/replace a DuckDB table from the generated CSV.
-
-        Notes:
-        - If your CSV contains multiple header rows, pass skip_rows = (header_rows_count - 1)
-          so the last header row becomes the CSV header.
+        Convert a column name to a stable DuckDB identifier.
+        We intentionally do NOT keep punctuation like "*No." because quoting + special chars
+        tends to create annoying edge cases for users.
         """
-        if duckdb is None:
-            raise Exception("duckdb package is not installed. Install with: pip install duckdb")
+        name = (col_name or "").strip()
+        if not name:
+            name = "col"
+        name = name.replace("*", "")
+        name = re.sub(r"[^A-Za-z0-9_]", "_", name)
+        name = re.sub(r"_+", "_", name).strip("_")
+        if not name:
+            name = "col"
+        if name[0].isdigit():
+            name = "col_" + name
+        return name.lower()
 
+    def create_duckdb_table_for_cursor(self, con, table_name: str, column_names: List[str]) -> str:
+        """
+        Create/replace DuckDB table with all columns as VARCHAR.
+        This avoids type inference failures/drops and guarantees all rows load.
+        """
         safe_table = self._sanitize_duckdb_table_name(table_name)
-        con = None
-        try:
-            con = duckdb.connect(duckdb_path)
-            # Use read_csv_auto so DuckDB infers types. header=true reads column names.
-            # skip skips the initial non-header rows (e.g., title rows).
-            con.execute(
-                f'CREATE OR REPLACE TABLE "{safe_table}" AS '
-                f"SELECT * FROM read_csv_auto(?, delim=?, header=true, skip=?)",
-                [csv_path, delimiter, skip_rows],
-            )
-            loaded_rows = con.execute(f'SELECT COUNT(*) FROM "{safe_table}"').fetchone()[0]
-        finally:
-            if con is not None:
-                con.close()
+        safe_cols = [self._sanitize_duckdb_column_name(c) for c in column_names]
 
-        return safe_table, int(loaded_rows)
+        col_defs = ", ".join([f'"{c}" VARCHAR' for c in safe_cols])
+        con.execute(f'CREATE OR REPLACE TABLE "{safe_table}" ({col_defs})')
+        return safe_table
+
+    def insert_rows_duckdb(self, con, table_name: str, column_names: List[str], rows: list) -> None:
+        if not rows:
+            return
+        safe_cols = [self._sanitize_duckdb_column_name(c) for c in column_names]
+        placeholders = ", ".join(["?"] * len(safe_cols))
+        col_list = ", ".join([f'"{c}"' for c in safe_cols])
+        con.executemany(
+            f'INSERT INTO "{table_name}" ({col_list}) VALUES ({placeholders})',
+            rows,
+        )
     
     def _read_file_with_encoding_fallback(self, file_path: str) -> Tuple[str, str]:
         """
@@ -317,6 +328,21 @@ class OracleExtractor:
             # Get column names and descriptions
             column_names = [desc[0] for desc in cursor.description]
             num_columns = len(column_names)
+
+            # Optional DuckDB persistence (direct insert from Oracle cursor batches)
+            duck_con = None
+            duck_table = None
+            if duckdb_path:
+                if duckdb is None:
+                    raise Exception("duckdb package is not installed. Install with: pip install duckdb")
+                os.makedirs(os.path.dirname(os.path.abspath(duckdb_path)) or ".", exist_ok=True)
+                duck_con = duckdb.connect(duckdb_path)
+                duck_table = self.create_duckdb_table_for_cursor(
+                    con=duck_con,
+                    table_name=duckdb_table_name or output_file,
+                    column_names=column_names,
+                )
+                duck_con.execute("BEGIN TRANSACTION")
             
             # Open CSV file for writing
             csv_file = open(output_file, 'w', newline='', encoding='utf-8')
@@ -362,6 +388,10 @@ class OracleExtractor:
                 
                 # Write to CSV
                 writer.writerows(rows)
+
+                # Write to DuckDB (direct)
+                if duck_con and duck_table:
+                    self.insert_rows_duckdb(duck_con, duck_table, column_names, rows)
                 
                 row_count += len(rows)
                 batch_count += 1
@@ -379,30 +409,16 @@ class OracleExtractor:
             print(f"✓ Query executed successfully")
             print(f"✓ Extracted {row_count:,} rows to {output_file}")
             if duckdb_path:
-                table = duckdb_table_name or output_file
-                skip_rows = 0
-                if custom_header_rows:
-                    # Skip all but the last header row (which is the real column header row)
-                    skip_rows = max(len(custom_header_rows) - 1, 0)
-                duck_table, loaded_rows = self.persist_csv_to_duckdb(
-                    duckdb_path=duckdb_path,
-                    table_name=table,
-                    csv_path=output_file,
-                    delimiter=delimiter,
-                    skip_rows=skip_rows,
-                )
+                assert duck_con is not None and duck_table is not None
+                duck_con.execute("COMMIT")
+                loaded_rows = duck_con.execute(f'SELECT COUNT(*) FROM "{duck_table}"').fetchone()[0]
                 print(f"✓ DuckDB table created/updated: {duck_table}")
                 print(f"  DuckDB file: {duckdb_path}")
-                print(f"  Access (CLI): duckdb \"{duckdb_path}\"")
                 print(f"  Query: SELECT * FROM \"{duck_table}\" LIMIT 10;")
-                if loaded_rows != row_count:
+                if int(loaded_rows) != int(row_count):
                     print(
-                        f"⚠ Row count mismatch: Oracle extracted {row_count:,} rows, "
-                        f"but DuckDB loaded {loaded_rows:,} rows."
-                    )
-                    print(
-                        "  Note: If you're comparing to a CSV line count, it can be misleading "
-                        "because CSV may contain multiple header rows and/or quoted newlines."
+                        f"✗ Row count mismatch (unexpected): Oracle extracted {row_count:,} rows, "
+                        f"DuckDB loaded {int(loaded_rows):,} rows."
                     )
             print(f"✓ Total time: {elapsed_time:.2f} seconds")
             
@@ -418,6 +434,13 @@ class OracleExtractor:
                 cursor.close()
             if csv_file:
                 csv_file.close()
+            if "duck_con" in locals() and duck_con is not None:
+                try:
+                    # If still in a transaction, roll back.
+                    duck_con.execute("ROLLBACK")
+                except Exception:
+                    pass
+                duck_con.close()
 
 
 def main():
