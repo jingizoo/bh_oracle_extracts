@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Oracle SQL Extract to CSV
+Oracle SQL Extract to CSV and Database Tables
 Reads a SQL query from a text file and generates a CSV extract with performance optimizations.
+Optionally writes data to a DuckDB table for local persistence.
 """
 
 import argparse
 import csv
 import sys
 import os
+import re
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Tuple
 
 try:
     import oracledb
@@ -21,9 +23,14 @@ except ImportError:
         print("Install with: pip install oracledb")
         sys.exit(1)
 
+try:
+    import duckdb
+except ImportError:
+    duckdb = None
+
 
 class OracleExtractor:
-    """Extract data from Oracle database to CSV with performance optimizations."""
+    """Extract data from Oracle database to CSV and optionally persist results to DuckDB."""
     
     def __init__(self, connection_string: str, username: str, password: str, 
                  host: str = None, port: int = 1521, service_name: str = None,
@@ -32,12 +39,12 @@ class OracleExtractor:
         Initialize Oracle extractor.
         
         Args:
-            connection_string: Full connection string (tnsnames format) or None
-            username: Database username
-            password: Database password
-            host: Database host (if not using connection_string)
-            port: Database port (default: 1521)
-            service_name: Service name or SID (if not using connection_string)
+            connection_string: Full connection string (tnsnames format) or None for source DB
+            username: Source database username
+            password: Source database password
+            host: Source database host (if not using connection_string)
+            port: Source database port (default: 1521)
+            service_name: Source service name or SID (if not using connection_string)
             arraysize: Number of rows to fetch at once (default: 10000)
             fetch_size: Buffer size for fetching (default: 10000)
         """
@@ -84,13 +91,94 @@ class OracleExtractor:
         """Close database connection."""
         if self.connection:
             self.connection.close()
-            print("✓ Database connection closed")
+            print("✓ Source database connection closed")
+
+    def _sanitize_duckdb_table_name(self, name: str) -> str:
+        """Convert a name to a safe DuckDB table identifier."""
+        name = os.path.splitext(os.path.basename(name))[0]
+        name = re.sub(r'[^A-Za-z0-9_]', '_', name)
+        if not name:
+            name = "extract"
+        if name[0].isdigit():
+            name = "t_" + name
+        # DuckDB supports longer identifiers, but keep it reasonable
+        return name.lower()
+
+    def persist_csv_to_duckdb(self, duckdb_path: str, table_name: str, csv_path: str,
+                              delimiter: str = ',', skip_rows: int = 0):
+        """
+        Create/replace a DuckDB table from the generated CSV.
+
+        Notes:
+        - If your CSV contains multiple header rows, pass skip_rows = (header_rows_count - 1)
+          so the last header row becomes the CSV header.
+        """
+        if duckdb is None:
+            raise Exception("duckdb package is not installed. Install with: pip install duckdb")
+
+        safe_table = self._sanitize_duckdb_table_name(table_name)
+        con = None
+        try:
+            con = duckdb.connect(duckdb_path)
+            # Use read_csv_auto so DuckDB infers types. header=true reads column names.
+            # skip skips the initial non-header rows (e.g., title rows).
+            con.execute(
+                f'CREATE OR REPLACE TABLE "{safe_table}" AS '
+                f"SELECT * FROM read_csv_auto(?, delim=?, header=true, skip=?)",
+                [csv_path, delimiter, skip_rows],
+            )
+        finally:
+            if con is not None:
+                con.close()
+
+        return safe_table
+    
+    def _read_file_with_encoding_fallback(self, file_path: str) -> Tuple[str, str]:
+        """
+        Read a file trying multiple encodings.
+        
+        Args:
+            file_path: Path to the file to read
+            
+        Returns:
+            Tuple of (file_content, encoding_used)
+            
+        Raises:
+            FileNotFoundError: If file doesn't exist
+            UnicodeDecodeError: If all encodings fail
+        """
+        # Try encodings in order of preference
+        encodings = ['utf-8', 'cp1252', 'latin-1', 'iso-8859-1', 'windows-1252']
+        
+        last_error = None
+        for encoding in encodings:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    content = f.read()
+                    if encoding != 'utf-8':
+                        print(f"  Note: File read using {encoding} encoding (not UTF-8)")
+                    return content, encoding
+            except UnicodeDecodeError as e:
+                last_error = e
+                continue
+            except Exception as e:
+                # For other errors (like FileNotFoundError), re-raise immediately
+                raise
+        
+        # If we get here, all encodings failed
+        raise UnicodeDecodeError(
+            last_error.encoding,
+            last_error.object,
+            last_error.start,
+            last_error.end,
+            f"Unable to decode file with any of the tried encodings: {', '.join(encodings)}"
+        )
     
     def read_sql_file(self, sql_file_path: str) -> str:
-        """Read SQL query from text file."""
+        """Read SQL query from text file with automatic encoding detection."""
         try:
-            with open(sql_file_path, 'r', encoding='utf-8') as f:
-                sql = f.read().strip()
+            sql, encoding = self._read_file_with_encoding_fallback(sql_file_path)
+            sql = sql.strip()
             
             if not sql:
                 raise ValueError("SQL file is empty")
@@ -102,16 +190,108 @@ class OracleExtractor:
         except Exception as e:
             raise Exception(f"Error reading SQL file: {str(e)}")
     
-    def execute_query(self, sql: str, output_file: str, delimiter: str = ',', 
-                     show_progress: bool = True):
+    def read_header_file(self, file_type: str, sql_file_dir: str = None) -> Optional[List[List[str]]]:
         """
-        Execute SQL query and write results to CSV.
+        Read custom headers from file based on file type.
+        Supports multiple header rows (e.g., title rows, data type rows).
+        
+        Naming convention: headers_<FILE_TYPE>.txt or headers_<FILE_TYPE>.csv
+        
+        File format: Each line represents one header row.
+        - If a line contains tabs, it's treated as tab-separated columns
+        - If a line contains commas (and no tabs), it's treated as comma-separated columns
+        - Empty lines are skipped
+        - Lines starting with '#' are treated as comments and skipped
+        
+        Args:
+            file_type: File type identifier (e.g., 'PO_HEADER')
+            sql_file_dir: Directory to look for header file (default: current directory)
+            
+        Returns:
+            List of header rows, where each row is a list of strings, or None if file not found
+        """
+        if not file_type:
+            return None
+        
+        # Determine search directory
+        if sql_file_dir:
+            search_dir = sql_file_dir
+        else:
+            search_dir = os.getcwd()
+        
+        # Try .txt first, then .csv
+        header_file = None
+        for ext in ['.txt', '.csv']:
+            candidate = os.path.join(search_dir, f"headers_{file_type}{ext}")
+            if os.path.exists(candidate):
+                header_file = candidate
+                break
+        
+        if not header_file:
+            print(f"⚠ Warning: Header file not found for file type '{file_type}'")
+            print(f"  Expected: headers_{file_type}.txt or headers_{file_type}.csv in {search_dir}")
+            return None
+        
+        try:
+            content, encoding = self._read_file_with_encoding_fallback(header_file)
+            lines = content.splitlines(keepends=True)
+            
+            if not lines:
+                raise ValueError(f"Header file is empty: {header_file}")
+            
+            header_rows = []
+            for line_num, line in enumerate(lines, 1):
+                line = line.strip()
+                
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Parse the line
+                # First, try tab-separated
+                if '\t' in line:
+                    row = [h.strip() for h in line.split('\t')]
+                # Then try comma-separated
+                elif ',' in line:
+                    row = [h.strip() for h in line.split(',')]
+                # Otherwise, single column
+                else:
+                    row = [line]
+                
+                # Remove empty columns at the end
+                while row and not row[-1]:
+                    row.pop()
+                
+                if row:
+                    header_rows.append(row)
+            
+            if not header_rows:
+                raise ValueError(f"No valid header rows found in {header_file}")
+            
+            print(f"✓ Read {len(header_rows)} header row(s) from {header_file}")
+            return header_rows
+            
+        except FileNotFoundError:
+            print(f"⚠ Warning: Header file not found: {header_file}")
+            return None
+        except Exception as e:
+            raise Exception(f"Error reading header file {header_file}: {str(e)}")
+    
+    def execute_query(self, sql: str, output_file: str, delimiter: str = ',', 
+                     show_progress: bool = True, custom_header_rows: Optional[List[List[str]]] = None,
+                     duckdb_path: str = None, duckdb_table_name: str = None):
+        """
+        Execute SQL query and write results to CSV and optionally persist to DuckDB.
         
         Args:
             sql: SQL query to execute
             output_file: Path to output CSV file
             delimiter: CSV delimiter (default: ',')
             show_progress: Whether to show progress (default: True)
+            custom_header_rows: Optional list of header rows (each row is a list of strings).
+                               The last row must match the number of SQL columns.
+            duckdb_path: Optional DuckDB database file to persist results into
+            duckdb_table_name: Optional table name (default: derived from SQL file name)
         """
         if not self.connection:
             raise Exception("Not connected to database. Call connect() first.")
@@ -133,15 +313,42 @@ class OracleExtractor:
             # Execute query
             cursor.execute(sql)
             
-            # Get column names
+            # Get column names and descriptions
             column_names = [desc[0] for desc in cursor.description]
+            num_columns = len(column_names)
             
             # Open CSV file for writing
             csv_file = open(output_file, 'w', newline='', encoding='utf-8')
             writer = csv.writer(csv_file, delimiter=delimiter)
             
-            # Write header
-            writer.writerow(column_names)
+            # Write custom header rows if provided
+            if custom_header_rows:
+                # Validate that the last header row matches column count
+                if not custom_header_rows:
+                    raise ValueError("custom_header_rows is empty")
+                
+                last_header_row = custom_header_rows[-1]
+                if len(last_header_row) != num_columns:
+                    raise ValueError(
+                        f"Header count mismatch: Last header row has {len(last_header_row)} columns, "
+                        f"but query returns {num_columns} columns"
+                    )
+                
+                # Write all header rows
+                for row_num, header_row in enumerate(custom_header_rows, 1):
+                    # Pad or truncate rows to match column count (except for the last row which should match exactly)
+                    if row_num < len(custom_header_rows):
+                        # Pad shorter rows with empty strings, truncate longer rows
+                        padded_row = (header_row + [''] * num_columns)[:num_columns]
+                        writer.writerow(padded_row)
+                    else:
+                        # Last row must match exactly (already validated above)
+                        writer.writerow(header_row)
+                
+                print(f"✓ Using custom headers ({len(custom_header_rows)} header row(s), {num_columns} columns)")
+            else:
+                # Use SQL column names as single header row
+                writer.writerow(column_names)
             
             # Fetch and write rows in batches (performance optimization)
             row_count = 0
@@ -152,7 +359,9 @@ class OracleExtractor:
                 if not rows:
                     break
                 
+                # Write to CSV
                 writer.writerows(rows)
+                
                 row_count += len(rows)
                 batch_count += 1
                 
@@ -168,6 +377,23 @@ class OracleExtractor:
             
             print(f"✓ Query executed successfully")
             print(f"✓ Extracted {row_count:,} rows to {output_file}")
+            if duckdb_path:
+                table = duckdb_table_name or output_file
+                skip_rows = 0
+                if custom_header_rows:
+                    # Skip all but the last header row (which is the real column header row)
+                    skip_rows = max(len(custom_header_rows) - 1, 0)
+                duck_table = self.persist_csv_to_duckdb(
+                    duckdb_path=duckdb_path,
+                    table_name=table,
+                    csv_path=output_file,
+                    delimiter=delimiter,
+                    skip_rows=skip_rows,
+                )
+                print(f"✓ DuckDB table created/updated: {duck_table}")
+                print(f"  DuckDB file: {duckdb_path}")
+                print(f"  Access (CLI): duckdb \"{duckdb_path}\"")
+                print(f"  Query: SELECT * FROM \"{duck_table}\" LIMIT 10;")
             print(f"✓ Total time: {elapsed_time:.2f} seconds")
             
             if row_count > 0:
@@ -187,21 +413,20 @@ class OracleExtractor:
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Extract data from Oracle database to CSV using SQL from a file',
+        description='Extract data from Oracle database to CSV and optionally persist results to DuckDB',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Using connection string (TNS names)
+  # Using connection string (TNS names) - CSV only
   python oracle_extract.py query.sql -u username -p password -c "hostname:port/service_name"
   
-  # Using host/port/service_name
-  python oracle_extract.py query.sql -u username -p password --host localhost --port 1521 --service-name ORCL
-  
-  # With custom output file and delimiter
-  python oracle_extract.py query.sql -u username -p password -c "hostname:port/service_name" -o output.csv --delimiter "|"
-  
-  # With performance tuning
-  python oracle_extract.py query.sql -u username -p password -c "hostname:port/service_name" --arraysize 50000
+  # CSV + DuckDB persistence
+  python oracle_extract.py query.sql -u username -p password -c "hostname:port/service_name" \\
+    --duckdb extracts.duckdb
+
+  # CSV + DuckDB persistence with custom table name
+  python oracle_extract.py query.sql -u username -p password -c "hostname:port/service_name" \\
+    --duckdb extracts.duckdb --duckdb-table po_hdr
         """
     )
     
@@ -221,6 +446,13 @@ Examples:
     # Output options
     parser.add_argument('-o', '--output', help='Output CSV file path (default: <sql_file>.csv)')
     parser.add_argument('--delimiter', default=',', help='CSV delimiter (default: ,)')
+    parser.add_argument('--file-type', help='File type identifier for custom headers (e.g., PO_HEADER). Looks for headers_<FILE_TYPE>.txt or headers_<FILE_TYPE>.csv in same directory as SQL file')
+
+    # DuckDB options (optional)
+    parser.add_argument('--duckdb', dest='duckdb_path',
+                        help='DuckDB database file path. If set, a table will be created/replaced for each extract.')
+    parser.add_argument('--duckdb-table', dest='duckdb_table',
+                        help='DuckDB table name (default: derived from SQL file name)')
     
     # Performance options
     parser.add_argument('--arraysize', type=int, default=10000, 
@@ -238,12 +470,21 @@ Examples:
     if args.host and not args.service_name:
         parser.error("--service-name is required when using --host")
     
+    if args.duckdb_path and duckdb is None:
+        parser.error("duckdb package is not installed. Install with: pip install duckdb")
+    
     # Determine output file
     if args.output:
         output_file = args.output
     else:
-        base_name = os.path.splitext(args.sql_file)[0]
-        output_file = f"{base_name}.csv"
+        sql_dir = os.path.dirname(os.path.abspath(args.sql_file)) if os.path.dirname(args.sql_file) else os.getcwd()
+        base_name = os.path.splitext(os.path.basename(args.sql_file))[0]
+        output_file = os.path.join(sql_dir, f"{base_name}.csv")
+    
+    # Determine DuckDB table name
+    duckdb_table_name = args.duckdb_table
+    if not duckdb_table_name and args.duckdb_path:
+        duckdb_table_name = os.path.splitext(os.path.basename(args.sql_file))[0]
     
     # Create extractor
     extractor = OracleExtractor(
@@ -258,22 +499,35 @@ Examples:
     )
     
     try:
-        # Connect to database
+        # Connect to source database
         if not extractor.connect():
             sys.exit(1)
         
         # Read SQL file
         sql = extractor.read_sql_file(args.sql_file)
         
-        # Execute query and generate CSV
+        # Read custom headers if file type specified
+        custom_header_rows = None
+        if args.file_type:
+            sql_file_dir = os.path.dirname(os.path.abspath(args.sql_file)) or os.getcwd()
+            custom_header_rows = extractor.read_header_file(args.file_type, sql_file_dir)
+            if custom_header_rows is None:
+                print(f"⚠ Continuing without custom headers for file type '{args.file_type}'")
+        
+        # Execute query and generate CSV (and optionally target table)
         extractor.execute_query(
             sql=sql,
             output_file=output_file,
             delimiter=args.delimiter,
-            show_progress=not args.no_progress
+            show_progress=not args.no_progress,
+            custom_header_rows=custom_header_rows,
+            duckdb_path=args.duckdb_path,
+            duckdb_table_name=duckdb_table_name
         )
         
         print(f"\n✓ Extract completed successfully: {output_file}")
+        if args.duckdb_path:
+            print(f"✓ Data also written to DuckDB: {args.duckdb_path}")
         
     except KeyboardInterrupt:
         print("\n\n✗ Operation cancelled by user")
