@@ -6,6 +6,7 @@ Optionally writes data to a DuckDB table for local persistence.
 """
 
 import argparse
+import base64
 import csv
 import sys
 import os
@@ -144,6 +145,43 @@ class OracleExtractor:
             f'INSERT INTO "{table_name}" ({col_list}) VALUES ({placeholders})',
             rows,
         )
+
+    def _convert_cell_for_outputs(self, value):
+        """
+        Convert Oracle-driver specific types (esp. LOBs) into plain Python scalars
+        that both CSV and DuckDB can reliably handle.
+        """
+        if value is None:
+            return None
+
+        # oracledb/cx_Oracle LOBs: convert to text / base64 string
+        # (DuckDB Python binding cannot ingest oracledb.LOB objects directly)
+        try:
+            lob_type = getattr(oracledb, "LOB", None)
+            if lob_type is not None and isinstance(value, lob_type):
+                data = value.read()
+                if isinstance(data, (bytes, bytearray, memoryview)):
+                    raw = bytes(data)
+                    return "BASE64:" + base64.b64encode(raw).decode("ascii")
+                return data
+        except Exception:
+            # If anything odd happens, fall back to stringification
+            return str(value)
+
+        # BLOBs sometimes come back as bytes-like directly
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            raw = bytes(value)
+            return "BASE64:" + base64.b64encode(raw).decode("ascii")
+
+        return value
+
+    def _convert_rows_for_outputs(self, rows: list) -> list:
+        if not rows:
+            return rows
+        out = []
+        for r in rows:
+            out.append(tuple(self._convert_cell_for_outputs(v) for v in r))
+        return out
     
     def _read_file_with_encoding_fallback(self, file_path: str) -> Tuple[str, str]:
         """
@@ -289,9 +327,10 @@ class OracleExtractor:
         except Exception as e:
             raise Exception(f"Error reading header file {header_file}: {str(e)}")
     
-    def execute_query(self, sql: str, output_file: str, delimiter: str = ',', 
+    def execute_query(self, sql: str, output_file: str, delimiter: str = ',',
                      show_progress: bool = True, custom_header_rows: Optional[List[List[str]]] = None,
-                     duckdb_path: str = None, duckdb_table_name: str = None):
+                     duckdb_path: str = None, duckdb_table_name: str = None,
+                     csv_quote_all: bool = False, excel_bom: bool = False):
         """
         Execute SQL query and write results to CSV and optionally persist to DuckDB.
         
@@ -345,8 +384,17 @@ class OracleExtractor:
                 duck_con.execute("BEGIN TRANSACTION")
             
             # Open CSV file for writing
-            csv_file = open(output_file, 'w', newline='', encoding='utf-8')
-            writer = csv.writer(csv_file, delimiter=delimiter)
+            # - newline='' is required for csv module on Windows
+            # - utf-8-sig writes a BOM so Excel reliably detects UTF-8
+            csv_encoding = 'utf-8-sig' if excel_bom else 'utf-8'
+            csv_file = open(output_file, 'w', newline='', encoding=csv_encoding)
+            writer = csv.writer(
+                csv_file,
+                delimiter=delimiter,
+                quoting=(csv.QUOTE_ALL if csv_quote_all else csv.QUOTE_MINIMAL),
+                quotechar='"',
+                doublequote=True,
+            )
             
             # Write custom header rows if provided
             if custom_header_rows:
@@ -385,15 +433,19 @@ class OracleExtractor:
                 rows = cursor.fetchmany(self.fetch_size)
                 if not rows:
                     break
+
+                # Normalize rows so CSV + DuckDB don't choke on Oracle-specific types (e.g., LOB)
+                rows_out = self._convert_rows_for_outputs(rows)
                 
                 # Write to CSV
-                writer.writerows(rows)
+                writer.writerows(rows_out)
 
                 # Write to DuckDB (direct)
                 if duck_con and duck_table:
-                    self.insert_rows_duckdb(duck_con, duck_table, column_names, rows)
+                    # DuckDB table is VARCHAR-only; let Python types flow through, LOBs already converted
+                    self.insert_rows_duckdb(duck_con, duck_table, column_names, rows_out)
                 
-                row_count += len(rows)
+                row_count += len(rows_out)
                 batch_count += 1
                 
                 if show_progress and batch_count % 10 == 0:
@@ -479,6 +531,10 @@ Examples:
     # Output options
     parser.add_argument('-o', '--output', help='Output CSV file path (default: <sql_file>.csv)')
     parser.add_argument('--delimiter', default=',', help='CSV delimiter (default: ,)')
+    parser.add_argument('--quote-all', action='store_true',
+                        help='Quote ALL fields in CSV output (Excel-friendly; prevents delimiter-in-data issues)')
+    parser.add_argument('--excel-bom', action='store_true',
+                        help='Write CSV as UTF-8 with BOM (utf-8-sig) so Excel detects encoding reliably')
     parser.add_argument('--file-type', help='File type identifier for custom headers (e.g., PO_HEADER). Looks for headers_<FILE_TYPE>.txt or headers_<FILE_TYPE>.csv in same directory as SQL file')
 
     # DuckDB options (optional)
@@ -555,7 +611,9 @@ Examples:
             show_progress=not args.no_progress,
             custom_header_rows=custom_header_rows,
             duckdb_path=args.duckdb_path,
-            duckdb_table_name=duckdb_table_name
+            duckdb_table_name=duckdb_table_name,
+            csv_quote_all=args.quote_all,
+            excel_bom=args.excel_bom,
         )
         
         print(f"\n✓ Extract completed successfully: {output_file}")
