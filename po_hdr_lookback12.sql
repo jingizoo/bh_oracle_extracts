@@ -27,18 +27,6 @@ hdr_candidates AS (
 ),
 
 /* ------------------------------
-   Require at least one distribution (align with line extracts)
-   ------------------------------ */
-po_has_distrib AS (
-  SELECT DISTINCT d.business_unit, d.po_id
-  FROM ps_po_line_distrib d
-  JOIN hdr_candidates hc
-    ON hc.business_unit = d.business_unit
-   AND hc.po_id         = d.po_id
-  WHERE d.distrib_ln_status <> 'X'
-),
-
-/* ------------------------------
    Receipts to date
    ------------------------------ */
 recv_agg AS (
@@ -79,7 +67,7 @@ vchr_sum AS (
   CROSS JOIN params p
   WHERE v.entry_status <> 'X'
     AND vl.po_id IS NOT NULL
-    AND NVL(TRIM(vl.po_id), '') <> ''
+    --AND NVL(TRIM(vl.po_id), '') <> ''
     AND NVL(v.invoice_dt, v.entered_dt) < (p.asof_dt + 1)
   GROUP BY vl.business_unit_po, vl.po_id, vl.line_nbr, NVL(vl.sched_nbr, 1)
 ),
@@ -178,41 +166,25 @@ sched_open AS (
      AND vs.sched_nbr     = s.sched_nbr
   ) x
 ),
-
-/* ------------------------------
-   Lookback activity
-   ------------------------------ */
-po_rcv_activity AS (
-  SELECT
-      r.business_unit_po AS business_unit,
-      r.po_id,
-      MAX(r.receipt_dttm) AS last_receipt_dttm
-  FROM ps_recv_ln_ship r
-  CROSS JOIN params p
-  WHERE r.recv_ship_status <> 'X'
-    AND r.receipt_dttm >= CAST(p.lookback_dt AS TIMESTAMP)
-    AND r.receipt_dttm <  CAST(p.asof_dt + 1 AS TIMESTAMP)
-  GROUP BY r.business_unit_po, r.po_id
-),
-
-po_inv_activity AS (
-  SELECT
-      vl.business_unit_po AS business_unit,
-      vl.po_id,
-      MAX(NVL(v.invoice_dt, v.entered_dt)) AS last_invoice_dt
-  FROM ps_voucher_line vl
-  JOIN ps_voucher v
-    ON v.business_unit = vl.business_unit
-   AND v.voucher_id    = vl.voucher_id
-  CROSS JOIN params p
-  WHERE vl.business_unit_po IS NOT NULL
-    AND vl.po_id IS NOT NULL
-    AND NVL(TRIM(vl.po_id),'') <> ''
-    AND v.entry_status <> 'X'
-    AND v.close_status <> 'C'
-    AND NVL(v.invoice_dt, v.entered_dt) >= p.lookback_dt
-    AND NVL(v.invoice_dt, v.entered_dt) <  (p.asof_dt + 1)
-  GROUP BY vl.business_unit_po, vl.po_id
+/* Precompute POs that have at least one OPEN schedule + active line + active distrib */
+open_po_eligible AS (
+  SELECT /*+ MATERIALIZE */
+         so.business_unit,
+         so.po_id
+    FROM sched_open so
+    JOIN ps_po_line l
+      ON l.business_unit = so.business_unit
+     AND l.po_id         = so.po_id
+     AND l.line_nbr      = so.line_nbr
+     AND l.cancel_status <> 'X'
+    JOIN ps_po_line_distrib d
+      ON d.business_unit      = so.business_unit
+     AND d.po_id              = so.po_id
+     AND d.line_nbr           = so.line_nbr
+     AND d.sched_nbr          = so.sched_nbr
+     AND d.distrib_ln_status <> 'X'
+   WHERE so.is_open = 1
+   GROUP BY so.business_unit, so.po_id
 ),
 
 /* ------------------------------
@@ -224,29 +196,15 @@ open_pos AS (
          hc.po_id
   FROM hdr_candidates hc
   CROSS JOIN params p
-  LEFT JOIN po_rcv_activity pra
-    ON pra.business_unit = hc.business_unit
-   AND pra.po_id         = hc.po_id
-  LEFT JOIN po_inv_activity pia
-    ON pia.business_unit = hc.business_unit
-   AND pia.po_id         = hc.po_id
   WHERE EXISTS (
     SELECT 1
-    FROM sched_open so
-    WHERE so.business_unit = hc.business_unit
-      AND so.po_id         = hc.po_id
-      AND so.is_open       = 1
+      FROM open_po_eligible ope
+     WHERE ope.business_unit = hc.business_unit
+       AND ope.po_id         = hc.po_id
   )
   AND (
        hc.po_dt >= p.lookback_dt
-    OR pra.last_receipt_dttm IS NOT NULL
-    OR pia.last_invoice_dt   IS NOT NULL
-  )
-  AND EXISTS (
-    SELECT 1
-    FROM po_has_distrib pd
-    WHERE pd.business_unit = hc.business_unit
-      AND pd.po_id         = hc.po_id
+
   )
 ),
 

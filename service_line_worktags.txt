@@ -1,0 +1,53 @@
+WITH base AS (
+    SELECT
+        po_id,
+        line_nbr,
+        ROW_NUMBER() OVER (
+            PARTITION BY po_id, line_nbr
+            ORDER BY
+                CASE field_name
+                    WHEN 'DEPTID'     THEN 1
+                    WHEN 'PROJECT_ID' THEN 2
+                    WHEN 'FUND_CODE'  THEN 3
+                END
+        ) AS row_num,
+        value
+    FROM (
+        SELECT
+            b.po_id,
+            b.line_nbr,
+            c.deptid,
+            c.project_id,
+            c.fund_code
+        FROM ps_po_hdr a
+        JOIN ps_po_line b
+          ON a.business_unit = b.business_unit
+         AND a.po_id = b.po_id
+        JOIN ps_po_line_distrib c
+          ON b.business_unit = c.business_unit
+         AND b.po_id = c.po_id
+         AND b.line_nbr = c.line_nbr
+        WHERE a.po_status NOT IN ('C','X')
+         AND b.cancel_status <> 'X'
+         AND c.distrib_ln_status <> 'X'
+    )
+    UNPIVOT (
+        value FOR field_name IN (
+            deptid     AS 'DEPTID',
+            project_id AS 'PROJECT_ID',
+            fund_code  AS 'FUND_CODE'
+        )
+    )
+    -- ? remove blanks BEFORE numbering
+    WHERE TRIM(value) IS NOT NULL
+)
+SELECT
+    po_id        AS "*No.",
+    line_nbr     AS "*Service Line Replacement Data Line No",
+    row_num      AS "*Worktags Line No",
+    value        AS "Worktags"
+FROM base 
+ORDER BY
+    po_id,
+    line_nbr,
+    row_num

@@ -1,0 +1,284 @@
+/* ============================================================================
+   Workday EIB – PO Invoice Lines – 12‑month lookback + Open PO scope
+   Slide alignment:
+   - PO‑Invoices: convert invoice lines tied to OPEN PO lines included in PO conversion criteria
+   - Lookback = 12 months (invoice_dt/entered_dt)
+   - Exclude service PO lines (do not convert partial service PO invoices)
+   ============================================================================ */
+
+WITH
+params AS (
+  SELECT TRUNC(SYSDATE) AS asof_dt,
+         ADD_MONTHS(TRUNC(SYSDATE), -12) AS lookback_dt
+  FROM dual
+),
+
+/* Candidate open POs (status only) */
+hdr_candidates AS (
+  SELECT /*+ MATERIALIZE */
+         h.business_unit, h.po_id, h.po_dt, h.po_status
+  FROM ps_po_hdr h
+  JOIN params p ON 1=1
+  WHERE h.po_dt <= p.asof_dt
+    AND h.po_status NOT IN ('C','X')
+),
+
+/* Receipt totals to date (used for open schedule calc) */
+recv_agg AS (
+  SELECT r.business_unit_po AS business_unit,
+         r.po_id, r.line_nbr, r.sched_nbr,
+         SUM(NVL(r.qty_sh_recvd_suom, 0))  AS qty_rcvd_suom,
+         SUM(NVL(r.merchandise_amt_po, 0)) AS merch_amt_rcvd_po
+  FROM ps_recv_ln_ship r
+  JOIN hdr_candidates hc
+    ON hc.business_unit = r.business_unit_po
+   AND hc.po_id         = r.po_id
+  JOIN params p
+    ON 1=1
+  WHERE r.recv_ship_status <> 'X'
+    AND r.receipt_dttm < CAST(p.asof_dt + 1 AS TIMESTAMP)
+  GROUP BY r.business_unit_po, r.po_id, r.line_nbr, r.sched_nbr
+),
+
+/* Schedule open/closed based on not fully received */
+sched_open AS (
+  SELECT s.business_unit, s.po_id, s.line_nbr, s.sched_nbr,
+         s.cancel_status,
+         s.qty_po,
+         s.merchandise_amt,
+         s.liquidate_method,
+         NVL(r.qty_rcvd_suom,0)     AS qty_rcvd_suom,
+         NVL(r.merch_amt_rcvd_po,0) AS merch_amt_rcvd_po,
+         CASE
+           WHEN NVL(s.cancel_status,' ') IN ('C','X') THEN 0
+           WHEN s.liquidate_method = 'A' THEN
+                CASE WHEN NVL(s.merchandise_amt,0) > NVL(r.merch_amt_rcvd_po,0) THEN 1 ELSE 0 END
+           ELSE
+                CASE WHEN NVL(s.qty_po,0) > NVL(r.qty_rcvd_suom,0) THEN 1 ELSE 0 END
+         END AS is_open
+  FROM ps_po_line_ship s
+  JOIN hdr_candidates hc
+    ON hc.business_unit = s.business_unit
+   AND hc.po_id         = s.po_id
+  LEFT JOIN recv_agg r
+    ON r.business_unit = s.business_unit
+   AND r.po_id         = s.po_id
+   AND r.line_nbr      = s.line_nbr
+   AND r.sched_nbr     = s.sched_nbr
+),
+
+open_pos AS (
+  SELECT DISTINCT hc.business_unit, hc.po_id, hc.po_dt
+  FROM hdr_candidates hc
+  WHERE EXISTS (
+    SELECT 1 FROM sched_open so
+    WHERE so.business_unit = hc.business_unit
+      AND so.po_id         = hc.po_id
+      AND so.is_open       = 1
+  )
+),
+
+/* Receipt activity within lookback */
+receipt_activity AS (
+  SELECT DISTINCT r.business_unit_po AS business_unit, r.po_id
+  FROM ps_recv_ln_ship r
+  JOIN params p ON 1=1
+  WHERE r.recv_ship_status <> 'X'
+    AND r.receipt_dttm >= CAST(p.lookback_dt AS TIMESTAMP)
+    AND r.receipt_dttm <  CAST(p.asof_dt + 1 AS TIMESTAMP)
+),
+
+/* Invoice activity within lookback (line-linked) */
+invoice_activity AS (
+  SELECT DISTINCT vl.business_unit_po AS business_unit, vl.po_id
+  FROM ps_voucher_line vl
+  JOIN ps_voucher v
+    ON v.business_unit = vl.business_unit
+   AND v.voucher_id    = vl.voucher_id
+  JOIN params p ON 1=1
+  WHERE v.entry_status <> 'X'
+    AND v.close_status <> 'C'
+    AND v.voucher_style <> 'ADJ'
+    AND vl.po_id IS NOT NULL
+    AND vl.po_id <> ' '
+    AND TRUNC(NVL(v.invoice_dt, v.entered_dt)) BETWEEN p.lookback_dt AND p.asof_dt
+),
+
+/* Final PO population */
+included_po AS (
+  SELECT op.business_unit, op.po_id
+  FROM open_pos op
+  JOIN params p ON 1=1
+  WHERE op.po_dt >= p.lookback_dt
+     OR EXISTS (SELECT 1 FROM receipt_activity ra WHERE ra.business_unit = op.business_unit AND ra.po_id = op.po_id)
+     OR EXISTS (SELECT 1 FROM invoice_activity ia WHERE ia.business_unit = op.business_unit AND ia.po_id = op.po_id)
+),
+
+/* Included OPEN GOODS lines (exclude service lines) */
+included_goods_lines AS (
+  SELECT /*+ MATERIALIZE */ DISTINCT
+         l.business_unit,
+         l.po_id,
+         l.line_nbr,
+         s.sched_nbr
+  FROM included_po ip
+  JOIN ps_po_line l
+    ON l.business_unit = ip.business_unit
+   AND l.po_id         = ip.po_id
+   AND l.physical_nature = 'G'
+  JOIN ps_po_line_ship s
+    ON s.business_unit = l.business_unit
+   AND s.po_id         = l.po_id
+   AND s.line_nbr      = l.line_nbr
+  JOIN sched_open so
+    ON so.business_unit = s.business_unit
+   AND so.po_id         = s.po_id
+   AND so.line_nbr      = s.line_nbr
+   AND so.sched_nbr     = s.sched_nbr
+   AND so.is_open       = 1
+  WHERE l.cancel_status <> 'X'
+    AND s.cancel_status <> 'X'
+),
+
+/* Original file’s CTEs */
+shipto_setid_by_bu AS (
+  SELECT r.setcntrlvalue AS business_unit_po, MAX(r.setid) AS shipto_setid
+  FROM ps_set_cntrl_rec r
+  WHERE r.recname = 'SHIPTO_TBL'
+  GROUP BY r.setcntrlvalue
+),
+shipto_ed AS (
+  SELECT st.setid, st.shipto_id, st.descr
+  FROM ps_shipto_tbl st
+  WHERE st.eff_status = 'A'
+    AND st.effdt = (
+      SELECT MAX(st2.effdt)
+      FROM ps_shipto_tbl st2
+      WHERE st2.setid     = st.setid
+        AND st2.shipto_id = st.shipto_id
+        AND st2.effdt    <= SYSDATE
+    )
+),
+
+base AS (
+  SELECT
+    v.business_unit,
+    v.voucher_id,
+    v.voucher_style,
+    ( NVL(v.saletx_amt, 0) + NVL(v.usetax_amt, 0) + NVL(v.vat_inv_amt, 0) + NVL(v.vat_noninv_amt, 0) ) AS taxable,
+    vl.voucher_line_num,
+    vl.descr,
+    vl.descr254_mixed,
+    vl.inv_item_id,
+    vl.po_id,
+    vl.line_nbr,
+    vl.sched_nbr,
+    vl.business_unit_po,
+    vl.cntrct_id,
+    vl.cntrct_line_nbr,
+    vl.shipto_id,
+    vl.tax_cd_sut,
+    vl.wthd_cd,
+    vl.sut_applicability,
+    vl.receipt_dt,
+    vl.qty_vchr,
+    vl.unit_of_measure,
+    vl.unit_price,
+    vl.merchandise_amt,
+    CASE
+      WHEN vl.po_id IS NULL OR TRIM(vl.po_id) = '' THEN NULL
+      WHEN SUBSTR(TRIM(vl.po_id), 1, 3) = 'PO-' THEN TRIM(vl.po_id)
+      WHEN TRANSLATE(TRIM(vl.po_id), '0123456789', '') IS NULL
+           THEN 'PO-' || LPAD(TRIM(vl.po_id), 8, '0')
+      ELSE 'PO-' || TRIM(vl.po_id)
+    END AS po_no
+  FROM ps_voucher v
+  JOIN ps_voucher_line vl
+    ON vl.business_unit = v.business_unit
+   AND vl.voucher_id    = v.voucher_id
+  JOIN included_goods_lines gl
+    ON gl.business_unit = vl.business_unit_po
+   AND gl.po_id         = vl.po_id
+   AND gl.line_nbr      = vl.line_nbr
+   AND gl.sched_nbr     = NVL(vl.sched_nbr, gl.sched_nbr)
+  JOIN params p
+    ON 1=1
+  WHERE v.entry_status <> 'X'
+    AND v.close_status <> 'C'
+    AND v.voucher_style <> 'ADJ'
+    AND TRUNC(NVL(v.invoice_dt, v.entered_dt)) BETWEEN p.lookback_dt AND p.asof_dt
+    AND vl.po_id IS NOT NULL
+    AND vl.po_id <> ' '
+)
+
+SELECT
+  b.voucher_id                                      AS "*No.",
+  b.voucher_id || '-' || b.voucher_line_num         AS "*Invoice Line Replacement Data Line No",
+  ' '                                               AS "Supplier Invoice Line ID",
+  b.voucher_line_num                                AS "Line Order",
+  'operating unit that maps to Company in WD'       AS "*Intercompany Affiliate",
+  ' '                                               AS "Purchase Item",
+  ' '                                               AS "Item Description",
+  CASE
+    WHEN b.po_no IS NOT NULL THEN b.po_no || '-' || TO_CHAR(b.line_nbr)
+    ELSE ' '
+  END                                               AS "Purchase Order Line",
+  CASE
+    WHEN TRIM(b.cntrct_id) IS NOT NULL AND TRIM(b.cntrct_id) <> ''
+    THEN TO_CHAR(b.cntrct_line_nbr)
+    ELSE ' '
+  END                                               AS "Supplier Contract Line",
+  ' '                                               AS "Customer Invoice Line",
+  ' '                                               AS "Supplier Invoice Line to Adjust",
+  ' '                                               AS "Spend Category",
+  ' '                                               AS "Commodity Code",
+  ' '                                               AS "Ship To Address",
+  ' '                                               AS "Ship To Contact Worker Type",
+  ' '                                               AS "Ship To Contact Worker ID",
+  ' '                                               AS "Accounting Treatment",
+  ' '                                               AS "Trackable Item",
+  CASE WHEN b.taxable > 0 THEN 'Taxable' ELSE ' ' END AS "Tax Applicability",
+  NVL(b.tax_cd_sut,' ')                             AS "Tax Code",
+  NVL(b.wthd_cd,' ')                                AS "Withholding Tax Code",
+  ' '                                               AS "Tax Point Date Type",
+  ' '                                               AS "Tax Point Date",
+  ' '                                               AS "Tax Rate 1",
+  ' '                                               AS "Tax Recoverability 1",
+  ' '                                               AS "Tax Option 1",
+  ' '                                               AS "Tax Recoverability 2",
+  ' '                                               AS "Tax Option 2",
+  ' '                                               AS "Tax Recoverability 3",
+  ' '                                               AS "Tax Option 3",
+  ' '                                               AS "Tax Recoverability 4",
+  ' '                                               AS "Tax Option 4",
+  ' '                                               AS "Tax Recoverability 5",
+  ' '                                               AS "Tax Option 5",
+  ' '                                               AS "Tax Recoverability 6",
+  ' '                                               AS "Tax Option 6",
+  ' '                                               AS "Packaging String",
+  b.qty_vchr                                        AS "Quantity",
+  b.unit_of_measure                                 AS "Unit of Measure",
+  b.unit_price                                      AS "Unit Cost",
+  b.merchandise_amt                                 AS "Extended Amount",
+  NULL                                              AS "Retention Amount",
+  NULL                                              AS "Payment Amount",
+  ' '                                               AS "Budget Date",
+  CASE WHEN b.voucher_style = 'PPAY' THEN 'Y' ELSE 'N' END AS "Prepaid",
+  NVL(b.cntrct_id,' ')                              AS "Supplier Contract",
+  CASE
+    WHEN b.receipt_dt IS NOT NULL THEN TO_CHAR(b.receipt_dt,'YYYY-MM-DD')
+    ELSE ' '
+  END                                               AS "Invoice Line Delivery Date",
+  ' '                                               AS "Invoice Line Billing Start Date",
+  ' '                                               AS "Invoice Line Billing End Date",
+  NVL(NULLIF(TRIM(b.descr254_mixed),''), TRIM(b.descr)) AS "Memo",
+  ' '                                               AS "Billable",
+  ' '                                               AS "Worktag Split Template"
+FROM base b
+LEFT JOIN shipto_setid_by_bu ss
+  ON ss.business_unit_po = b.business_unit_po
+LEFT JOIN shipto_ed st
+  ON st.setid     = ss.shipto_setid
+ AND st.shipto_id = b.shipto_id
+ORDER BY b.voucher_id, b.voucher_line_num
+;

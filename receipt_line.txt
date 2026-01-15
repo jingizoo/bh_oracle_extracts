@@ -1,0 +1,76 @@
+WITH recv_base AS (
+  SELECT
+    rls.business_unit_po,
+    rls.receiver_id,
+    rls.po_id,
+    rls.line_nbr,
+    rls.sched_nbr,
+    rls.shipto_id,
+    rls.descr254_mixed          AS recv_descr,
+    rld.distrib_line_num,
+    rld.business_unit_gl,
+    rld.location,
+    rld.merchandise_amt         AS recv_merch_amt,
+    rld.delivery_feedback
+  FROM ps_recv_ln_ship rls
+  JOIN ps_recv_ln_distrib rld
+    ON rld.business_unit      = rls.business_unit
+   AND rld.receiver_id        = rls.receiver_id
+   AND rld.recv_ln_nbr        = rls.recv_ln_nbr
+   AND rld.recv_ship_seq_nbr  = rls.recv_ship_seq_nbr
+  WHERE 1=1
+    AND rls.recv_ship_status <> 'X'
+    AND rld.recv_ds_status   <> 'X'
+    AND rld.dst_acct_type    = 'DST'
+),
+
+svc_pol AS (
+  SELECT
+    l.business_unit,
+    l.po_id,
+    l.line_nbr,
+    l.cntrct_id,
+    l.cntrct_line_nbr
+  FROM ps_po_line l
+  WHERE l.physical_nature = 'S'
+)
+
+SELECT
+  rb.receiver_id AS "*No",
+  rb.line_nbr AS "*Receipt Service Line Replacement Line No",
+  (CASE
+     WHEN SUBSTR(TRIM(rb.po_id), 1, 3) = 'PO-' THEN TRIM(rb.po_id)
+     WHEN TRANSLATE(TRIM(rb.po_id), '0123456789', '') IS NULL
+          THEN 'PO-' || LPAD(TRIM(rb.po_id), 8, '0')
+     ELSE 'PO-' || TRIM(rb.po_id)
+   END) || '-' || TO_CHAR(rb.line_nbr) AS "Purchase Order Line",
+  CASE
+    WHEN TRIM(pl.cntrct_id) IS NOT NULL AND TRIM(pl.cntrct_id) <> ''
+      THEN TRIM(pl.cntrct_id) || '-' || TO_CHAR(pl.cntrct_line_nbr)
+    ELSE ' '
+  END AS "Supplier Contract Line",
+  MAX(rb.business_unit_gl) KEEP (DENSE_RANK FIRST ORDER BY rb.distrib_line_num) AS "Line Company",
+  SUM(NVL(rb.recv_merch_amt,0)) AS "Extended Amount",
+  NVL(MAX(rb.shipto_id) KEEP (DENSE_RANK FIRST ORDER BY rb.distrib_line_num), ' ') AS "Ship To Address",
+  ' ' AS "Ship To Contact Worker Type",
+  ' ' AS "Ship To Contact Worker ID",
+  MAX(rb.location) KEEP (DENSE_RANK FIRST ORDER BY rb.distrib_line_num) AS "Deliver To",
+  ' ' AS "Commodity Code",
+  COALESCE(
+    MAX(NULLIF(TRIM(rb.delivery_feedback),'')) KEEP (DENSE_RANK FIRST ORDER BY rb.distrib_line_num),
+    MAX(NULLIF(TRIM(rb.recv_descr),''))         KEEP (DENSE_RANK FIRST ORDER BY rb.distrib_line_num),
+    ' '
+  ) AS "Memo"
+FROM recv_base rb
+JOIN svc_pol pl
+  ON pl.business_unit = rb.business_unit_po
+ AND pl.po_id         = rb.po_id
+ AND pl.line_nbr      = rb.line_nbr
+GROUP BY
+  rb.receiver_id,
+  rb.po_id,
+  rb.line_nbr,
+  pl.cntrct_id,
+  pl.cntrct_line_nbr
+HAVING SUM(NVL(rb.recv_merch_amt,0)) > 0
+ORDER BY 1, 2;

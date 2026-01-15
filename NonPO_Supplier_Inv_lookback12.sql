@@ -1,4 +1,19 @@
+/* ============================================================================
+   Workday EIB – Non‑PO Supplier Invoices (HEADER) – 12‑month lookback
+   Slide alignment:
+   - Non‑PO invoices: convert approved/unpaid invoices within last 12 months
+   - Exclude any voucher that has PO on ANY voucher line (header-po blank is not enough)
+   - Exclude adjustments (handled by Supplier Invoice Adjustments file)
+   ============================================================================ */
+
 WITH
+params AS (
+  SELECT
+    TRUNC(SYSDATE)                  AS asof_dt,
+    ADD_MONTHS(TRUNC(SYSDATE), -12) AS lookback_dt
+  FROM dual
+),
+
 /* 1) Drive set */
 voucher_base AS (
     SELECT /*+ MATERIALIZE */
@@ -24,17 +39,24 @@ voucher_base AS (
         v.voucher_style,
         v.prepaid_ref
     FROM ps_voucher v
+    JOIN params p
+      ON 1=1
     WHERE v.entry_status <> 'X'
       AND v.close_status <> 'C'
-      AND v.po_id <> ' '              -- WARNING: This filters to vouchers with header PO_ID only
-                                       -- If vouchers have PO only on lines (not header), they will be excluded
-                                       -- even though po_list could populate them. Remove this filter if you
-                                       -- want "any voucher with PO at header OR line"
-      -- BATCH FILTER: REQUIRED to prevent PGA blowup (ORA-04036)
-      -- Use bind variables (recommended for production):
-      AND v.entered_dt >= :p_from_dt AND v.entered_dt < :p_to_dt
-      -- Or hardcode for testing (uncomment and comment out bind variable line above):
-      -- AND v.entered_dt >= DATE '2026-01-01' AND v.entered_dt < DATE '2026-02-01'
+      AND v.voucher_style <> 'ADJ'
+      /* 12‑month lookback */
+      AND TRUNC(NVL(v.invoice_dt, v.entered_dt)) BETWEEN p.lookback_dt AND p.asof_dt
+      /* Non‑PO: header PO blank */
+      AND NVL(v.po_id,' ') = ' '
+      /* Non‑PO: AND no PO on ANY line */
+      AND NOT EXISTS (
+          SELECT 1
+          FROM ps_voucher_line vlx
+          WHERE vlx.business_unit = v.business_unit
+            AND vlx.voucher_id    = v.voucher_id
+            AND vlx.po_id IS NOT NULL
+            AND vlx.po_id <> ' '
+      )
 ),
 
 /* 2) ONE pass over voucher lines for these vouchers */
@@ -66,32 +88,13 @@ line_first AS (
     GROUP BY business_unit, voucher_id
 ),
 
-/* distinct PO list from lines (index-friendly predicate; trim only in projection) */
-/* LISTAGG overflow protection: ON OVERFLOW TRUNCATE prevents ORA-01489 (requires Oracle 12.2+) */
-po_list AS (
-    SELECT
-        business_unit,
-        voucher_id,
-        LISTAGG(po_id, ';' ON OVERFLOW TRUNCATE '...' WITHOUT COUNT) WITHIN GROUP (ORDER BY po_id) AS po_list
-    FROM (
-        SELECT DISTINCT
-            business_unit,
-            voucher_id,
-            TRIM(po_id) AS po_id
-        FROM lines_base
-        WHERE po_id IS NOT NULL
-          AND po_id <> ' '
-    )
-    GROUP BY business_unit, voucher_id
-),
-
 /* distinct Contract list from lines */
-/* LISTAGG overflow protection: ON OVERFLOW TRUNCATE prevents ORA-01489 (requires Oracle 12.2+) */
 cntrct_list AS (
     SELECT
         business_unit,
         voucher_id,
-        LISTAGG(cntrct_id, ';' ON OVERFLOW TRUNCATE '...' WITHOUT COUNT) WITHIN GROUP (ORDER BY cntrct_id) AS cntrct_list
+        LISTAGG(cntrct_id, ';' ON OVERFLOW TRUNCATE '...' WITHOUT COUNT)
+          WITHIN GROUP (ORDER BY cntrct_id) AS cntrct_list
     FROM (
         SELECT DISTINCT
             business_unit,
@@ -105,7 +108,6 @@ cntrct_list AS (
 ),
 
 /* memo aggregation - ORDER BY removed to reduce PGA usage */
-/* If memo ordering is required, uncomment ORDER BY but expect higher PGA usage */
 memo_agg AS (
     SELECT
         business_unit,
@@ -125,7 +127,6 @@ memo_agg AS (
                             ' '
                         ) || ' | '
                     )
-                    -- ORDER BY voucher_line_num  -- COMMENTED OUT: Removed to reduce PGA usage
                 ).EXTRACT('//text()') AS CLOB
             ),
             ' | '
@@ -243,13 +244,7 @@ vendor_loc_pick AS (
     GROUP BY setid, vendor_id
 ),
 
-/* 
- * supp_conn: Ensures 1 row per voucher by picking ONE address + ONE location per vendor
- * This prevents cartesian explosion that causes PGA blowup
- * vendor_addr_pick: MIN(address_seq_num) per vendor = 1 row per vendor
- * vendor_loc_pick: MIN(vndr_loc) per vendor = 1 row per vendor
- * Result: 1 row per voucher (no multiplication)
- */
+/* 1 row per voucher (no multiplication) */
 supp_conn AS (
     SELECT
         vb.business_unit,
@@ -279,102 +274,92 @@ supp_conn AS (
      AND vpp.vndr_loc  = vlp.vndr_loc
 )
 
-SELECT /*+ LEADING(v) */
-    -- USE_HASH hint removed for PGA safety (can increase PGA usage on large batches)
-    -- If you need to force join method, consider USE_NL for nested loops (lower PGA, slower)
+SELECT
     v.voucher_id                AS "*No.",
-    'Y' AS "Add Only",
-    ' ' AS "Supplier Invoice Reference For Update",
+    'Y'                         AS "Add Only",
+    ' '                         AS "Supplier Invoice Reference For Update",
     v.voucher_id                AS "Supplier Invoice ID",
-    'Y' AS "Submit",
-    ' ' AS "Locked in Workday",
-    ' ' AS "Invoice Number",
-    ' ' AS "Gapless Document Number",
-    ' ' AS "Invoice Document Status",
-    'Peoplesoft' AS "External Supplier Invoice Source",
-    ' ' AS "Cancel Accounting Date",
-    ' ' AS "Invoice Accounting Date",
+    'Y'                         AS "Submit",
+    ' '                         AS "Locked in Workday",
+    ' '                         AS "Invoice Number",
+    ' '                         AS "Gapless Document Number",
+    'Approved'                  AS "Invoice Document Status",
+    'Peoplesoft'                AS "External Supplier Invoice Source",
+    ' '                         AS "Cancel Accounting Date",
+    ' '                         AS "Invoice Accounting Date",
     v.business_unit_gl          AS "*Company",
-    ' ' AS "Payment Practices",
+    ' '                         AS "Payment Practices",
     v.txn_currency_cd           AS "*Currency",
     wd.bh_wd_supplier_id        AS "Supplier",
-    ' ' AS "Contingent Worker ID",
+    ' '                         AS "Contingent Worker ID",
     sc.supplier_connection_id   AS "Supplier Connection",
-    ' ' AS "Use Default Supplier Connection",
-    'only need to populate if there is tax on the header' AS "Default Tax Option",
+    ' '                         AS "Use Default Supplier Connection",
+    ' '                         AS "Default Tax Option",
+    ' '                         AS "Ship-To Address",
     NVL(lf.shipto_id, ' ')      AS "Ship-To Address ID",
-    ' ' AS "Tax Code",
-    ' ' AS "Default Withholding Tax Code",
-    TO_CHAR(v.invoice_dt,  'YYYY-MM-DD') AS "*Invoice Date",
-    TO_CHAR(v.entered_dt,  'YYYY-MM-DD') AS "Invoice Received Date",
-    ' ' AS "Invoice Delivery Date",
-    ' ' AS "Invoice Billing Start Date",
-    ' ' AS "Invoice Billing End Date",
-    ' ' AS "Discount Amount Override",
-    ' ' AS "Discount Date Override",
-    TO_CHAR(v.due_dt,      'YYYY-MM-DD') AS "Due Date Override",
-    ' ' AS "Accounting Date Override",
-    ' ' AS "Budget Date",
+    ' '                         AS "Tax Code",
+    ' '                         AS "Default Withholding Tax Code",
+    TO_CHAR(v.invoice_dt, 'YYYY-MM-DD') AS "*Invoice Date",
+    TO_CHAR(v.entered_dt, 'YYYY-MM-DD') AS "Invoice Received Date",
+    ' '                         AS "Invoice Delivery Date",
+    ' '                         AS "Invoice Billing Start Date",
+    ' '                         AS "Invoice Billing End Date",
+    ' '                         AS "Discount Amount Override",
+    ' '                         AS "Discount Date Override",
+    TO_CHAR(v.due_dt, 'YYYY-MM-DD') AS "Due Date Override",
+    ' '                         AS "Accounting Date Override",
+    ' '                         AS "Budget Date",
     NVL(p.pymnt_hold, 'N')      AS "On Hold",
-    ' ' AS "Control Amount Total",
+    ' '                         AS "Control Amount Total",
     ( NVL(v.saletx_amt, 0) + NVL(v.usetax_amt, 0) + NVL(v.vat_inv_amt, 0) + NVL(v.vat_noninv_amt, 0) ) AS "Tax Amount",
-    ' ' AS "Withholding Tax Amount",
+    ' '                         AS "Withholding Tax Amount",
     v.freight_amt               AS "Freight Amount",
     v.misc_amt                  AS "Other Charges",
-    ' ' AS "Worktag Split Template",
-    ' ' AS "Tax Only",
-    ' ' AS "Down Payment",
-    ' ' AS "Down Payment Purchase Order Reference",
-    ' ' AS "Supplier Document Received",
+    ' '                         AS "Worktag Split Template",
+    ' '                         AS "Tax Only",
+    ' '                         AS "Down Payment",
+    ' '                         AS "Down Payment Purchase Order Reference",
+    ' '                         AS "Supplier Document Received",
     v.invoice_id                AS "Suppliers Invoice Number",
-    CASE
-        WHEN v.po_id IS NOT NULL AND v.po_id <> ' ' THEN TRIM(v.po_id)
-        ELSE NVL(pl.po_list, ' ')
-    END AS "External PO Number",
-    CASE
-        WHEN v.cntrct_id IS NOT NULL AND v.cntrct_id <> ' ' THEN TRIM(v.cntrct_id)
-        ELSE NVL(cl.cntrct_list, ' ')
-    END AS "Supplier Contract",
-    ' ' AS "Document Link",
-    ' ' AS "Supplier Invoice Request",
-    ' ' AS "Requester Worker Type",
-    ' ' AS "Requester ID",
-    ' ' AS "Statutory Invoice Type",
+    ' '                         AS "External PO Number",
+    NVL(NULLIF(TRIM(v.cntrct_id), ''), NVL(cl.cntrct_list, ' ')) AS "Supplier Contract",
+    ' '                         AS "Document Link",
+    ' '                         AS "Supplier Invoice Request",
+    ' '                         AS "Requester Worker Type",
+    ' '                         AS "Requester ID",
+    ' '                         AS "Statutory Invoice Type",
     NVL(ma.memo_text, ' ')      AS "Memo",
-    ' ' AS "Approver Worker Type",
-    ' ' AS "Approver ID",
+    ' '                         AS "Approver Worker Type",
+    ' '                         AS "Approver ID",
     v.pymnt_terms_cd            AS "*Payment Terms",
     'check remit to'            AS "Override Payment Type",
-    ' ' AS "Additional Type",
-    ' ' AS "Additional Reference Number",
+    ' '                         AS "Additional Type",
+    ' '                         AS "Additional Reference Number",
     NVL(p.pymnt_handling_cd, ' ') AS "Handling Code",
     CASE
         WHEN v.voucher_style = 'PPAY' OR TRIM(v.prepaid_ref) <> '' THEN 'Y'
         ELSE 'N'
-    END AS "Prepaid",
+    END                         AS "Prepaid",
     CASE
         WHEN v.voucher_style = 'PPAY' OR TRIM(v.prepaid_ref) <> '' THEN 'SCHEDULE'
         ELSE ' '
-    END AS "Prepayment Release Type",
-    ' ' AS "Release Date",
-    ' ' AS "Frequency",
-    ' ' AS "Number of Installments",
-    ' ' AS "Use Invoice Date",
-    ' ' AS "From Date",
-    ' ' AS "Gross Invoice Amount",
-    ' ' AS "Total Amount Retained",
-    ' ' AS "Total Amount Released",
-    ' ' AS "Retention Memo",
-    ' ' AS "Total Down Payment Applied Amount",
-    ' ' AS "Net Supplier Invoice Amount"
+    END                         AS "Prepayment Release Type",
+    ' '                         AS "Release Date",
+    ' '                         AS "Frequency",
+    ' '                         AS "Number of Installments",
+    ' '                         AS "Use Invoice Date",
+    ' '                         AS "From Date",
+    ' '                         AS "Gross Invoice Amount",
+    ' '                         AS "Total Amount Retained",
+    ' '                         AS "Total Amount Released",
+    ' '                         AS "Retention Memo",
+    ' '                         AS "Total Down Payment Applied Amount",
+    ' '                         AS "Net Supplier Invoice Amount"
 FROM voucher_base v
 LEFT JOIN pymnt1       p  ON p.business_unit = v.business_unit AND p.voucher_id = v.voucher_id
 LEFT JOIN line_first   lf ON lf.business_unit = v.business_unit AND lf.voucher_id = v.voucher_id
-LEFT JOIN po_list      pl ON pl.business_unit = v.business_unit AND pl.voucher_id = v.voucher_id
 LEFT JOIN cntrct_list  cl ON cl.business_unit = v.business_unit AND cl.voucher_id = v.voucher_id
 LEFT JOIN memo_agg     ma ON ma.business_unit = v.business_unit AND ma.voucher_id = v.voucher_id
 LEFT JOIN supp_conn    sc ON sc.business_unit = v.business_unit AND sc.voucher_id = v.voucher_id
 LEFT JOIN ps_bh_wd_sup_1to1 wd ON v.vendor_id = wd.bh_wd_ps_vendor_id
--- ORDER BY v.voucher_id  -- COMMENTED OUT: Removed to prevent PGA blowup from large sorts
--- If ordering is required, sort in application layer or use smaller batches
 ;

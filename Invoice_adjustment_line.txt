@@ -1,0 +1,92 @@
+/* LISTAGG overflow protection: ON OVERFLOW TRUNCATE prevents ORA-01489 (requires Oracle 12.2+) */
+WITH po_list AS (
+    SELECT
+        business_unit,
+        voucher_id,
+        LISTAGG(po_id, ';' ON OVERFLOW TRUNCATE '...' WITHOUT COUNT) WITHIN GROUP(
+            ORDER BY
+                po_id
+        ) AS external_po_number
+    FROM
+        (
+            SELECT DISTINCT
+                business_unit,
+                voucher_id,
+                TRIM(po_id) AS po_id
+            FROM
+                ps_voucher_line
+            WHERE
+                TRIM(po_id) IS NOT NULL
+                AND TRIM(po_id) <> ''
+        )
+    GROUP BY
+        business_unit,
+        voucher_id
+)
+SELECT
+    v.voucher_id          AS "*No.",
+    v.voucher_id
+    || '-'
+    || vl.voucher_line_num AS "*Invoice Line Replacement Data Line No",
+    ' ' AS "Supplier Invoice Line ID",
+vl.voucher_line_num   AS "Line Order",
+    'xwalk' AS "*Intercompany Affiliate",
+    ' ' as "Purchase Item",
+    ' ' AS "Item Description",
+    ' ' AS "Purchase Order Line",
+    ' ' AS "Supplier Contract Line",
+    ' ' AS "Customer Invoice Line",
+    ' ' AS "Supplier Invoice Line to Adjust",
+    'Conversion' AS "*Spend Category",
+    ' ' AS "Commodity Code",
+    ' ' AS "Ship To Address",
+    ' ' AS "Ship To Contact Is Employee",
+    ' ' AS "Ship To Contact Worker ID",
+    ' ' AS "Accounting Treatment",
+    ' ' AS "Trackable Item",
+    ' ' AS "Tax Applicability",
+    ' ' AS "Tax Code",
+    ' ' AS "Withholding Tax Code",
+    ' ' AS "Tax Point Date Type",
+    ' ' AS "Tax Point Date",
+    ' ' AS "Tax Rate 1",
+    ' ' AS "Tax Recoverability 1",
+    ' ' AS "Tax Option 1",
+    ' ' AS "Tax Recoverability 2",
+    ' ' AS "Tax Option 2",
+    ' ' AS "Tax Recoverability 3",
+    ' ' AS "Tax Option 3",
+    ' ' AS "Tax Recoverability 4",
+    ' ' AS "Tax Option 4",
+    ' ' AS "Tax Recoverability 5",
+    ' ' AS "Tax Option 5",
+    ' ' AS "Tax Recoverability 6",
+    ' ' AS "Tax Option 6",
+    ' ' AS "Packaging String",
+    ' ' AS "Quantity",
+    ' ' AS "Unit of Measure",
+    ' ' AS "Unit Cost",
+    vl.merchandise_amt             AS "Extended Amount",
+    ' ' AS "Retention Amount",
+    ' ' AS "Payment Amount",
+    ' ' AS "Budget Date",
+    ' ' AS "Prepaid",
+    ' ' AS "Supplier Contract",
+    ' ' AS "Invoice Line Delivery Date",
+    ' ' AS "Invoice Line Billing Start Date",
+    ' ' AS "Invoice Line Billing End Date",
+    nvl(pl.external_po_number, ' ') AS "Memo",
+    ' ' AS "Billable",
+    ' ' AS "Worktag Split Template"
+FROM
+    ps_voucher        v
+    JOIN ps_voucher_line   vl ON vl.business_unit = v.business_unit
+                               AND vl.voucher_id = v.voucher_id
+    LEFT JOIN po_list           pl ON pl.business_unit = v.business_unit
+                            AND pl.voucher_id = v.voucher_id
+WHERE
+    v.voucher_style = 'ADJ'
+    AND v.entry_status <> 'X'
+    AND v.close_status <> 'C'
+ORDER BY
+    v.voucher_id

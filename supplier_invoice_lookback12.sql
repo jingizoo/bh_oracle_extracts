@@ -1,5 +1,139 @@
 WITH
 /* 1) Drive set */
+
+params AS (
+  /* Set :p_asof_dt if you want repeatable cutover testing */
+  SELECT
+    TRUNC(SYSDATE)                  AS asof_dt,
+    ADD_MONTHS(TRUNC(SYSDATE), -12) AS lookback_dt
+  FROM dual
+),
+
+/* ------------------------------------------------------------------------
+   PO conversion scope (open POs with activity in last 12 months)
+   Used to determine which PO-invoices to bring over.
+   ------------------------------------------------------------------------ */
+po_hdr_candidates AS (
+  SELECT /*+ MATERIALIZE */
+         h.business_unit,
+         h.po_id,
+         h.po_dt,
+         h.po_status
+    FROM ps_po_hdr h
+    CROSS JOIN params p
+   WHERE h.po_dt <= p.asof_dt
+     AND h.po_status NOT IN ('C','X')
+),
+recv_agg AS (
+  SELECT
+      r.business_unit_po AS business_unit,
+      r.po_id,
+      r.line_nbr,
+      r.sched_nbr,
+      SUM(NVL(r.qty_sh_recvd_suom, 0))  AS qty_rcvd_suom,
+      SUM(NVL(r.merchandise_amt_po, 0)) AS merch_amt_rcvd_po
+  FROM ps_recv_ln_ship r
+  JOIN po_hdr_candidates hc
+    ON hc.business_unit = r.business_unit_po
+   AND hc.po_id         = r.po_id
+  CROSS JOIN params p
+  WHERE r.recv_ship_status <> 'X'
+    AND r.receipt_dttm < CAST(p.asof_dt + 1 AS TIMESTAMP)
+  GROUP BY r.business_unit_po, r.po_id, r.line_nbr, r.sched_nbr
+),
+sched_open AS (
+  SELECT
+      s.business_unit,
+      s.po_id,
+      s.line_nbr,
+      s.sched_nbr,
+      s.cancel_status,
+      s.qty_po,
+      s.merchandise_amt,
+      s.liquidate_method,
+      NVL(r.qty_rcvd_suom, 0)      AS qty_rcvd_suom,
+      NVL(r.merch_amt_rcvd_po, 0)  AS merch_amt_rcvd_po,
+      CASE
+        WHEN NVL(s.cancel_status,' ') IN ('C','X') THEN 0
+        WHEN s.liquidate_method = 'A' THEN
+             CASE WHEN NVL(s.merchandise_amt,0) > NVL(r.merch_amt_rcvd_po,0) THEN 1 ELSE 0 END
+        ELSE
+             CASE WHEN NVL(s.qty_po,0) > NVL(r.qty_rcvd_suom,0) THEN 1 ELSE 0 END
+      END AS is_open
+  FROM ps_po_line_ship s
+  JOIN po_hdr_candidates hc
+    ON hc.business_unit = s.business_unit
+   AND hc.po_id         = s.po_id
+  LEFT JOIN recv_agg r
+    ON r.business_unit  = s.business_unit
+   AND r.po_id          = s.po_id
+   AND r.line_nbr       = s.line_nbr
+   AND r.sched_nbr      = s.sched_nbr
+),
+po_rcv_activity AS (
+  SELECT
+      r.business_unit_po AS business_unit,
+      r.po_id,
+      MAX(r.receipt_dttm) AS last_receipt_dttm
+  FROM ps_recv_ln_ship r
+  CROSS JOIN params p
+  WHERE r.recv_ship_status <> 'X'
+    AND r.receipt_dttm >= CAST(p.lookback_dt AS TIMESTAMP)
+    AND r.receipt_dttm <  CAST(p.asof_dt + 1 AS TIMESTAMP)
+  GROUP BY r.business_unit_po, r.po_id
+),
+po_inv_activity AS (
+  SELECT
+      vl.business_unit_po AS business_unit,
+      vl.po_id,
+      MAX(NVL(v.invoice_dt, v.entered_dt)) AS last_invoice_dt
+  FROM ps_voucher_line vl
+  JOIN ps_voucher v
+    ON v.business_unit = vl.business_unit
+   AND v.voucher_id    = vl.voucher_id
+  CROSS JOIN params p
+  WHERE vl.business_unit_po IS NOT NULL
+    AND vl.po_id IS NOT NULL
+    AND TRIM(vl.po_id) <> ''
+    AND v.entry_status <> 'X'
+    AND v.close_status <> 'C'
+    AND NVL(v.invoice_dt, v.entered_dt) >= p.lookback_dt
+    AND NVL(v.invoice_dt, v.entered_dt) <= p.asof_dt
+  GROUP BY vl.business_unit_po, vl.po_id
+),
+open_pos AS (
+  /* Open POs in scope = open schedules AND activity within lookback */
+  SELECT /*+ MATERIALIZE */
+         hc.business_unit,
+         hc.po_id
+    FROM po_hdr_candidates hc
+    CROSS JOIN params p
+    LEFT JOIN po_rcv_activity pra
+      ON pra.business_unit = hc.business_unit
+     AND pra.po_id         = hc.po_id
+    LEFT JOIN po_inv_activity pia
+      ON pia.business_unit = hc.business_unit
+     AND pia.po_id         = hc.po_id
+   WHERE EXISTS (
+         SELECT 1
+           FROM sched_open so
+          WHERE so.business_unit = hc.business_unit
+            AND so.po_id         = hc.po_id
+            AND so.is_open       = 1
+       )
+     AND (
+          hc.po_dt >= p.lookback_dt
+       OR pra.last_receipt_dttm IS NOT NULL
+       OR pia.last_invoice_dt   IS NOT NULL
+     )
+),
+
+/* ------------------------------------------------------------------------
+   Voucher driver set per conversion approach
+   - PO invoices: only those tied to OPEN POs in-scope (via VOUCHER_LINE.BUSINESS_UNIT_PO/PO_ID),
+                 and exclude any voucher that has SERVICE PO lines (per “do not convert partial service PO invoices”)
+   - Non-PO invoices: approved/unpaid (open) invoices in the last 12 months
+   ------------------------------------------------------------------------ */
 voucher_base AS (
     SELECT /*+ MATERIALIZE */
         v.business_unit,
@@ -24,20 +158,58 @@ voucher_base AS (
         v.voucher_style,
         v.prepaid_ref
     FROM ps_voucher v
+    CROSS JOIN params p
     WHERE v.entry_status <> 'X'
       AND v.close_status <> 'C'
-      AND v.po_id <> ' '              -- WARNING: This filters to vouchers with header PO_ID only
-                                       -- If vouchers have PO only on lines (not header), they will be excluded
-                                       -- even though po_list could populate them. Remove this filter if you
-                                       -- want "any voucher with PO at header OR line"
-      -- BATCH FILTER: REQUIRED to prevent PGA blowup (ORA-04036)
-      -- Use bind variables (recommended for production):
-      AND v.entered_dt >= :p_from_dt AND v.entered_dt < :p_to_dt
-      -- Or hardcode for testing (uncomment and comment out bind variable line above):
-      -- AND v.entered_dt >= DATE '2026-01-01' AND v.entered_dt < DATE '2026-02-01'
+      AND NVL(v.invoice_dt, v.entered_dt) >= p.lookback_dt
+      AND NVL(v.invoice_dt, v.entered_dt) <= p.asof_dt
+      AND (
+            /* A) PO-Invoices for OPEN POs in-scope (goods only) */
+            (
+              EXISTS (
+                SELECT 1
+                FROM ps_voucher_line vl
+                JOIN open_pos op
+                  ON op.business_unit = vl.business_unit_po
+                 AND op.po_id         = vl.po_id
+                JOIN ps_po_line pl
+                  ON pl.business_unit = vl.business_unit_po
+                 AND pl.po_id         = vl.po_id
+                 AND pl.line_nbr      = vl.line_nbr
+                 AND pl.physical_nature = 'G'
+                WHERE vl.business_unit = v.business_unit
+                  AND vl.voucher_id    = v.voucher_id
+                  AND NVL(TRIM(vl.po_id),'') <> ''
+              )
+              AND NOT EXISTS (
+                /* exclude vouchers touching SERVICE PO lines */
+                SELECT 1
+                FROM ps_voucher_line vl2
+                JOIN ps_po_line pl2
+                  ON pl2.business_unit = vl2.business_unit_po
+                 AND pl2.po_id         = vl2.po_id
+                 AND pl2.line_nbr      = vl2.line_nbr
+                WHERE vl2.business_unit = v.business_unit
+                  AND vl2.voucher_id    = v.voucher_id
+                  AND NVL(TRIM(vl2.po_id),'') <> ''
+                  AND pl2.physical_nature = 'S'
+              )
+            )
+            OR
+            /* B) Non-PO invoices: no PO at header AND no PO on lines */
+            (
+              NVL(TRIM(v.po_id),'') = ''
+              AND NOT EXISTS (
+                SELECT 1
+                FROM ps_voucher_line vl3
+                WHERE vl3.business_unit = v.business_unit
+                  AND vl3.voucher_id    = v.voucher_id
+                  AND NVL(TRIM(vl3.po_id),'') <> ''
+              )
+            )
+      )
 ),
 
-/* 2) ONE pass over voucher lines for these vouchers */
 lines_base AS (
     SELECT /*+ MATERIALIZE */
         vl.business_unit,
@@ -301,7 +473,8 @@ SELECT /*+ LEADING(v) */
     ' ' AS "Contingent Worker ID",
     sc.supplier_connection_id   AS "Supplier Connection",
     ' ' AS "Use Default Supplier Connection",
-    'only need to populate if there is tax on the header' AS "Default Tax Option",
+NVL( NVL(v.saletx_amt, 0) + NVL(v.usetax_amt, 0) + NVL(v.vat_inv_amt, 0) + NVL(v.vat_noninv_amt, 0),0) AS "Default Tax Option",
+    ' ' AS "Ship-To Address",
     NVL(lf.shipto_id, ' ')      AS "Ship-To Address ID",
     ' ' AS "Tax Code",
     ' ' AS "Default Withholding Tax Code",
@@ -375,6 +548,3 @@ LEFT JOIN cntrct_list  cl ON cl.business_unit = v.business_unit AND cl.voucher_i
 LEFT JOIN memo_agg     ma ON ma.business_unit = v.business_unit AND ma.voucher_id = v.voucher_id
 LEFT JOIN supp_conn    sc ON sc.business_unit = v.business_unit AND sc.voucher_id = v.voucher_id
 LEFT JOIN ps_bh_wd_sup_1to1 wd ON v.vendor_id = wd.bh_wd_ps_vendor_id
--- ORDER BY v.voucher_id  -- COMMENTED OUT: Removed to prevent PGA blowup from large sorts
--- If ordering is required, sort in application layer or use smaller batches
-;

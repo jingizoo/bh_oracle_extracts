@@ -1,0 +1,65 @@
+with base as (
+    SELECT
+        po_id,
+              line_nbr,
+        ROW_NUMBER() OVER(
+            PARTITION BY po_id, line_nbr
+            ORDER BY
+                CASE field_name
+                    WHEN 'DEPTID' THEN
+                        1
+                    ELSE
+                        2
+                END
+        ) AS row_num,
+        value
+    FROM
+        (
+            SELECT
+                b.po_id,
+                b.line_nbr,
+                c.deptid,
+                c.project_id
+            FROM
+                ps_po_hdr            a
+                JOIN ps_po_line           b ON a.business_unit = b.business_unit
+                                     AND a.po_id = b.po_id
+                JOIN ps_po_line_distrib   c ON b.business_unit = c.business_unit
+                                             AND b.po_id = c.po_id
+                                                 AND b.line_nbr = c.line_nbr
+                                                 WHERE
+        1 = 1
+        AND a.po_status NOT IN (
+            'C',
+            'X'
+        )
+        AND b.cancel_status <> 'X'
+       -- AND s.cancel_status <> 'X'
+        AND c.distrib_ln_status <> 'X'
+   -- WHERE a.business_unit ='80800' and c.project_id=' ' and c.deptid<>' '--b.po_id = '0000013144'
+        ) UNPIVOT ( value FOR field_name
+        IN ( deptid AS 'DEPTID',
+             project_id AS 'PROJECT_ID' ) )
+-- ? filter AFTER unpivot
+    WHERE
+        TRIM(value) IS NOT NULL
+    ORDER BY
+        po_id,
+        line_nbr,
+        row_num
+)
+ select
+        
+        /*  CASE
+            WHEN substr(TRIM(b.po_id), 1, 3) = 'PO-' THEN TRIM(b.po_id)
+            WHEN translate(TRIM(b.po_id), '0123456789', '') IS NULL THEN
+                'PO-'
+                || lpad(TRIM(b.po_id), 8, '0')
+            ELSE
+                'PO-' || TRIM(b.po_id)
+        END AS "*No.",*/
+        b.po_id as "*No.",
+    b.line_nbr as "*Service Line Replacement Data Line No" ,
+    b.row_num as "*Worktags Line No",
+    b.value  as "Worktags"
+ from base b

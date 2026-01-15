@@ -1,0 +1,51 @@
+WITH base AS (
+    SELECT
+        voucher_id,
+        voucher_line_num,
+        ROW_NUMBER() OVER(
+            PARTITION BY voucher_id, voucher_line_num
+            ORDER BY
+                CASE field_name
+                    WHEN 'DEPTID' THEN
+                        1
+                    ELSE
+                        2
+                END
+        ) AS row_num,
+        value
+    FROM
+        (
+            SELECT
+                v.voucher_id,
+                vl.voucher_line_num,
+                d.deptid,
+                d.project_id
+            FROM
+                ps_voucher        v
+                JOIN ps_voucher_line   vl ON vl.business_unit = v.business_unit
+                                           AND vl.voucher_id = v.voucher_id
+                JOIN ps_distrib_line   d ON vl.business_unit = d.business_unit
+                                          AND vl.voucher_id = d.voucher_id
+                                            AND vl.voucher_line_num = d.voucher_line_num
+            WHERE
+                v.entry_status <> 'X'
+                AND v.close_status <> 'C'
+                AND v.voucher_style = 'ADJ'
+        ) UNPIVOT ( value
+            FOR field_name
+        IN ( deptid AS 'DEPTID',
+             project_id AS 'PROJECT_ID' ) )
+    WHERE
+        TRIM(value) IS NOT NULL
+    ORDER BY
+        voucher_id,
+        voucher_line_num,
+        row_num
+)
+SELECT
+    b.voucher_id         AS "No.",
+    b.voucher_line_num   AS "Invoice Line Replacement Data Line No",
+    b.row_num            AS "Worktags Line No",
+    b.value              AS "Worktags"
+FROM
+    base b

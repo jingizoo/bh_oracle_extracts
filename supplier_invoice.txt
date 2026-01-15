@@ -32,7 +32,9 @@ voucher_base AS (
                                        -- want "any voucher with PO at header OR line"
       -- BATCH FILTER: REQUIRED to prevent PGA blowup (ORA-04036)
       -- Use bind variables (recommended for production):
-      AND v.entered_dt >= :p_from_dt AND v.entered_dt < :p_to_dt
+   --   AND v.entered_dt >= :p_from_dt AND v.entered_dt < :p_to_dt
+       AND v.entered_dt >= TO_DATE('01-01-2015', 'DD-MM-YYYY')
+AND v.entered_dt <  TO_DATE('01-01-2019', 'DD-MM-YYYY')
       -- Or hardcode for testing (uncomment and comment out bind variable line above):
       -- AND v.entered_dt >= DATE '2026-01-01' AND v.entered_dt < DATE '2026-02-01'
 ),
@@ -301,7 +303,8 @@ SELECT /*+ LEADING(v) */
     ' ' AS "Contingent Worker ID",
     sc.supplier_connection_id   AS "Supplier Connection",
     ' ' AS "Use Default Supplier Connection",
-    'only need to populate if there is tax on the header' AS "Default Tax Option",
+NVL( NVL(v.saletx_amt, 0) + NVL(v.usetax_amt, 0) + NVL(v.vat_inv_amt, 0) + NVL(v.vat_noninv_amt, 0),0) AS "Default Tax Option",
+    ' ' AS "Ship-To Address",
     NVL(lf.shipto_id, ' ')      AS "Ship-To Address ID",
     ' ' AS "Tax Code",
     ' ' AS "Default Withholding Tax Code",
@@ -377,4 +380,3 @@ LEFT JOIN supp_conn    sc ON sc.business_unit = v.business_unit AND sc.voucher_i
 LEFT JOIN ps_bh_wd_sup_1to1 wd ON v.vendor_id = wd.bh_wd_ps_vendor_id
 -- ORDER BY v.voucher_id  -- COMMENTED OUT: Removed to prevent PGA blowup from large sorts
 -- If ordering is required, sort in application layer or use smaller batches
-;
