@@ -105,7 +105,7 @@ class OracleExtractor:
         return name.lower()
 
     def persist_csv_to_duckdb(self, duckdb_path: str, table_name: str, csv_path: str,
-                              delimiter: str = ',', skip_rows: int = 0):
+                              delimiter: str = ',', skip_rows: int = 0) -> tuple[str, int]:
         """
         Create/replace a DuckDB table from the generated CSV.
 
@@ -127,11 +127,12 @@ class OracleExtractor:
                 f"SELECT * FROM read_csv_auto(?, delim=?, header=true, skip=?)",
                 [csv_path, delimiter, skip_rows],
             )
+            loaded_rows = con.execute(f'SELECT COUNT(*) FROM "{safe_table}"').fetchone()[0]
         finally:
             if con is not None:
                 con.close()
 
-        return safe_table
+        return safe_table, int(loaded_rows)
     
     def _read_file_with_encoding_fallback(self, file_path: str) -> Tuple[str, str]:
         """
@@ -383,7 +384,7 @@ class OracleExtractor:
                 if custom_header_rows:
                     # Skip all but the last header row (which is the real column header row)
                     skip_rows = max(len(custom_header_rows) - 1, 0)
-                duck_table = self.persist_csv_to_duckdb(
+                duck_table, loaded_rows = self.persist_csv_to_duckdb(
                     duckdb_path=duckdb_path,
                     table_name=table,
                     csv_path=output_file,
@@ -394,6 +395,15 @@ class OracleExtractor:
                 print(f"  DuckDB file: {duckdb_path}")
                 print(f"  Access (CLI): duckdb \"{duckdb_path}\"")
                 print(f"  Query: SELECT * FROM \"{duck_table}\" LIMIT 10;")
+                if loaded_rows != row_count:
+                    print(
+                        f"⚠ Row count mismatch: Oracle extracted {row_count:,} rows, "
+                        f"but DuckDB loaded {loaded_rows:,} rows."
+                    )
+                    print(
+                        "  Note: If you're comparing to a CSV line count, it can be misleading "
+                        "because CSV may contain multiple header rows and/or quoted newlines."
+                    )
             print(f"✓ Total time: {elapsed_time:.2f} seconds")
             
             if row_count > 0:
