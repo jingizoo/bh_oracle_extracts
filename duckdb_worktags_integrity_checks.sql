@@ -17,77 +17,77 @@ These checks validate:
 SELECT
   (SELECT COUNT(*) FROM good_worktags_8011501)    AS goods_wt_rows,
   (SELECT COUNT(*) FROM service_worktags_8011501) AS service_wt_rows,
-  (SELECT COUNT(DISTINCT "*No.") FROM good_worktags_8011501)    AS goods_wt_pos,
-  (SELECT COUNT(DISTINCT "*No.") FROM service_worktags_8011501) AS service_wt_pos;
+  (SELECT COUNT(DISTINCT no) FROM good_worktags_8011501)    AS goods_wt_pos,
+  (SELECT COUNT(DISTINCT no) FROM service_worktags_8011501) AS service_wt_pos;
 
 -- 2) Duplicate worktags keys (goods): (*No., goods line no, worktags line no)
-SELECT "*No." AS po_no,
-       "*Goods Line Replacement Data Line No" AS line_no,
-       "*Worktags Line No" AS wt_line_no,
+SELECT no AS po_no,
+       goods_line_replacement_data_line_no AS line_no,
+       worktags_line_no AS wt_line_no,
        COUNT(*) AS cnt
 FROM good_worktags_8011501
-GROUP BY "*No.", "*Goods Line Replacement Data Line No", "*Worktags Line No"
+GROUP BY no, goods_line_replacement_data_line_no, worktags_line_no
 HAVING COUNT(*) > 1
 ORDER BY cnt DESC, po_no, line_no, wt_line_no;
 
 -- 3) Duplicate worktags keys (service): (*No., service line no, worktags line no)
-SELECT "*No." AS po_no,
-       "*Service Line Replacement Data Line No" AS line_no,
-       "*Worktags Line No" AS wt_line_no,
+SELECT no AS po_no,
+       service_line_replacement_data_line_no AS line_no,
+       worktags_line_no AS wt_line_no,
        COUNT(*) AS cnt
 FROM service_worktags_8011501
-GROUP BY "*No.", "*Service Line Replacement Data Line No", "*Worktags Line No"
+GROUP BY no, service_line_replacement_data_line_no, worktags_line_no
 HAVING COUNT(*) > 1
 ORDER BY cnt DESC, po_no, line_no, wt_line_no;
 
 -- 4) Blank/NULL worktags values (goods + service) (should be empty)
 SELECT 'goods' AS src, *
 FROM good_worktags_8011501
-WHERE COALESCE(TRIM("*Worktags"), '') = ''
+WHERE COALESCE(TRIM(worktags), '') = ''
 UNION ALL
 SELECT 'service' AS src, *
 FROM service_worktags_8011501
-WHERE COALESCE(TRIM("*Worktags"), '') = ''
+WHERE COALESCE(TRIM(worktags), '') = ''
 LIMIT 50;
 
 -- 5) Worktags line numbering should be contiguous per PO line:
 --     min = 1 AND max = count (no gaps) (goods)
-SELECT "*No." AS po_no,
-       "*Goods Line Replacement Data Line No" AS line_no,
-       MIN("*Worktags Line No") AS min_wt_line_no,
-       MAX("*Worktags Line No") AS max_wt_line_no,
+SELECT no AS po_no,
+       goods_line_replacement_data_line_no AS line_no,
+       MIN(worktags_line_no) AS min_wt_line_no,
+       MAX(worktags_line_no) AS max_wt_line_no,
        COUNT(*) AS cnt
 FROM good_worktags_8011501
-GROUP BY "*No.", "*Goods Line Replacement Data Line No"
-HAVING MIN("*Worktags Line No") <> 1
-    OR MAX("*Worktags Line No") <> COUNT(*)
+GROUP BY no, goods_line_replacement_data_line_no
+HAVING MIN(worktags_line_no) <> 1
+    OR MAX(worktags_line_no) <> COUNT(*)
 ORDER BY po_no, line_no
 LIMIT 200;
 
 -- 6) Worktags line numbering should be contiguous per PO line (service)
-SELECT "*No." AS po_no,
-       "*Service Line Replacement Data Line No" AS line_no,
-       MIN("*Worktags Line No") AS min_wt_line_no,
-       MAX("*Worktags Line No") AS max_wt_line_no,
+SELECT no AS po_no,
+       service_line_replacement_data_line_no AS line_no,
+       MIN(worktags_line_no) AS min_wt_line_no,
+       MAX(worktags_line_no) AS max_wt_line_no,
        COUNT(*) AS cnt
 FROM service_worktags_8011501
-GROUP BY "*No.", "*Service Line Replacement Data Line No"
-HAVING MIN("*Worktags Line No") <> 1
-    OR MAX("*Worktags Line No") <> COUNT(*)
+GROUP BY no, service_line_replacement_data_line_no
+HAVING MIN(worktags_line_no) <> 1
+    OR MAX(worktags_line_no) <> COUNT(*)
 ORDER BY po_no, line_no
 LIMIT 200;
 
 -- 7) Worktags must reference existing goods lines (by PO + Line Number)
 WITH wt AS (
   SELECT DISTINCT
-    "*No." AS po_no,
-    "*Goods Line Replacement Data Line No" AS line_no
+    no AS po_no,
+    goods_line_replacement_data_line_no AS line_no
   FROM good_worktags_8011501
 ),
 gl AS (
   SELECT DISTINCT
-    "*No." AS po_no,
-    "Line Number" AS line_no
+    no AS po_no,
+    line_number AS line_no
   FROM goods_line2
 )
 SELECT wt.po_no, wt.line_no
@@ -100,14 +100,14 @@ LIMIT 200;
 -- 8) Worktags must reference existing service lines (by PO + Line Number)
 WITH wt AS (
   SELECT DISTINCT
-    "*No." AS po_no,
-    "*Service Line Replacement Data Line No" AS line_no
+    no AS po_no,
+    service_line_replacement_data_line_no AS line_no
   FROM service_worktags_8011501
 ),
 sl AS (
   SELECT DISTINCT
-    "*No." AS po_no,
-    "Line Number" AS line_no
+    no AS po_no,
+    line_number AS line_no
   FROM service_line2
 )
 SELECT wt.po_no, wt.line_no
@@ -119,11 +119,11 @@ LIMIT 200;
 
 -- 9) Lines missing ANY worktags (goods)
 WITH gl AS (
-  SELECT DISTINCT "*No." AS po_no, "Line Number" AS line_no
+  SELECT DISTINCT no AS po_no, line_number AS line_no
   FROM goods_line2
 ),
 wt AS (
-  SELECT DISTINCT "*No." AS po_no, "*Goods Line Replacement Data Line No" AS line_no
+  SELECT DISTINCT no AS po_no, goods_line_replacement_data_line_no AS line_no
   FROM good_worktags_8011501
 )
 SELECT gl.po_no, gl.line_no
@@ -135,11 +135,11 @@ LIMIT 200;
 
 -- 10) Lines missing ANY worktags (service)
 WITH sl AS (
-  SELECT DISTINCT "*No." AS po_no, "Line Number" AS line_no
+  SELECT DISTINCT no AS po_no, line_number AS line_no
   FROM service_line2
 ),
 wt AS (
-  SELECT DISTINCT "*No." AS po_no, "*Service Line Replacement Data Line No" AS line_no
+  SELECT DISTINCT no AS po_no, service_line_replacement_data_line_no AS line_no
   FROM service_worktags_8011501
 )
 SELECT sl.po_no, sl.line_no
@@ -174,23 +174,23 @@ LIMIT 200;
 -- Dept worktags are expected to look like CC_<OU>-<DEPTID> (based on the SQL generation)
 SELECT *
 FROM good_worktags_8011501
-WHERE "*Worktags" LIKE 'CC_%'
-  AND "*Worktags" NOT LIKE 'CC_%-%'
+WHERE worktags LIKE 'CC_%'
+  AND worktags NOT LIKE 'CC_%-%'
 LIMIT 200;
 
 SELECT *
 FROM service_worktags_8011501
-WHERE "*Worktags" LIKE 'CC_%'
-  AND "*Worktags" NOT LIKE 'CC_%-%'
+WHERE worktags LIKE 'CC_%'
+  AND worktags NOT LIKE 'CC_%-%'
 LIMIT 200;
 
 -- 13) Ensure no PO- prefix sneaked into worktags extracts
-SELECT 'goods' AS src, "*No." AS po_no
+SELECT 'goods' AS src, no AS po_no
 FROM good_worktags_8011501
-WHERE "*No." LIKE 'PO-%'
+WHERE no LIKE 'PO-%'
 UNION ALL
-SELECT 'service' AS src, "*No." AS po_no
+SELECT 'service' AS src, no AS po_no
 FROM service_worktags_8011501
-WHERE "*No." LIKE 'PO-%'
+WHERE no LIKE 'PO-%'
 LIMIT 200;
 
