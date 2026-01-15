@@ -11,6 +11,9 @@ Examples:
 
   # Export an arbitrary query to CSV
   python duckdb_query.py "C:\\path\\extracts.duckdb" --sql "select * from service_po_line limit 100" --output out.csv
+
+  # Export query from a .sql file to CSV (avoids multiline shell quoting)
+  python duckdb_query.py "C:\\path\\extracts.duckdb" --sql-file query.sql --output out.csv
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ def main() -> int:
 
     group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("--sql", help="SQL to execute (wrap in quotes)")
+    group.add_argument("--sql-file", dest="sql_file", help="Path to .sql file containing a single SELECT query")
     group.add_argument("--table", help="Table name to export (SELECT * FROM <table>)")
 
     parser.add_argument("--output", help="Output CSV file path")
@@ -69,7 +73,11 @@ def main() -> int:
                 print(t)
             return 0
 
-        query = _build_sql(args.table, args.sql, args.limit)
+        sql_text = args.sql
+        if args.sql_file:
+            with open(args.sql_file, "r", encoding="utf-8") as f:
+                sql_text = f.read()
+        query = _build_sql(args.table, sql_text, args.limit)
 
         if not args.output:
             # Print to stdout (first 1000 rows max to avoid accidental huge output)
