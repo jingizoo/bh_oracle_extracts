@@ -123,13 +123,13 @@ LIMIT 50;
 -- 12) Fully paid lines should be excluded (goods)
 SELECT *
 FROM goods_po_line
-WHERE COALESCE(extended_amount, 0) <= 0
+WHERE COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) <= 0.0
 LIMIT 50;
 
 -- 13) Fully paid lines should be excluded (service)
 SELECT *
 FROM service_po_line
-WHERE COALESCE(extended_amount, 0) <= 0
+WHERE COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) <= 0.0
 LIMIT 50;
 
 -- 14) Service item should be blank
@@ -165,9 +165,9 @@ LIMIT 50;
 
 -- 18) Total extended amount per PO (goods + service), top 50
 WITH all_lines AS (
-  SELECT no AS po_no, COALESCE(extended_amount, 0) AS amt FROM goods_po_line
+  SELECT no AS po_no, COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) AS amt FROM goods_po_line
   UNION ALL
-  SELECT no AS po_no, COALESCE(extended_amount, 0) AS amt FROM service_po_line
+  SELECT no AS po_no, COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) AS amt FROM service_po_line
 )
 SELECT po_no, SUM(amt) AS total_extended_amt, COUNT(*) AS line_cnt
 FROM all_lines
@@ -562,20 +562,22 @@ LIMIT 200;
 SELECT
   no AS po_no,
   line_number AS line_nbr,
-  extended_amount
+  COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) AS extended_amount_num,
+  extended_amount AS extended_amount_raw
 FROM goods_po_line
-WHERE extended_amount > 0
-  AND extended_amount <= 1
-ORDER BY extended_amount ASC
+WHERE COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) > 0.0
+  AND COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) <= 1.0
+ORDER BY extended_amount_num ASC
 LIMIT 200;
 
 -- 50) Amount tolerance sanity: service lines with Extended Amount between 0 and 1 (review list)
 SELECT
   no AS po_no,
   line_number AS line_nbr,
-  extended_amount
+  COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) AS extended_amount_num,
+  extended_amount AS extended_amount_raw
 FROM service_po_line
-WHERE extended_amount > 0
-  AND extended_amount <= 1
-ORDER BY extended_amount ASC
+WHERE COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) > 0.0
+  AND COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) <= 1.0
+ORDER BY extended_amount_num ASC
 LIMIT 200;
