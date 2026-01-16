@@ -1,25 +1,4 @@
-/*
-Oracle / SQL Developer integrity checks (mirror of duckdb_integrity_checks.sql)
 
-How to use in SQL Developer
-1) Open this file in SQL Developer.
-2) Replace the three CTE bodies (hdr_src / goods_src / service_src) by pasting the
-   SELECT statements from:
-   - bh_oracle_extracts/po_hdr_lookback12.sql
-   - bh_oracle_extracts/Goods_line2.txt
-   - bh_oracle_extracts/service_line2.txt
-3) Run the script. Each section below is a standalone query (like the DuckDB version).
-
-Notes
-- Oracle uses FETCH FIRST N ROWS ONLY (instead of LIMIT N).
-- Column names like "*No." require double-quotes in Oracle.
-*/
-
-/* ============================================================
-   Define extract datasets (PASTE YOUR SELECTs inside each CTE)
-   ============================================================ */
-
--- Header extract dataset
 WITH hdr_src AS (
   /* PASTE the SELECT from bh_oracle_extracts/po_hdr_lookback12.sql here */
   SELECT 1 AS dummy FROM dual

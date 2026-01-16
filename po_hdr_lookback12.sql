@@ -472,6 +472,51 @@ buyer_userid AS (
 ),
 
 /* ------------------------------
+   Buyer assignment helpers
+   ------------------------------ */
+po_req_flag AS (
+  /* has_req = 1 if any PO distrib references a requisition header */
+  SELECT
+      op.business_unit,
+      op.po_id,
+      MAX(CASE WHEN rh.req_id IS NOT NULL THEN 1 ELSE 0 END) AS has_req
+  FROM open_pos op
+  JOIN ps_po_line_distrib d
+    ON d.business_unit = op.business_unit
+   AND d.po_id         = op.po_id
+  LEFT JOIN ps_req_hdr rh
+    ON rh.business_unit = d.business_unit_req
+   AND rh.req_id        = d.req_id
+  GROUP BY op.business_unit, op.po_id
+),
+entered_by_person AS (
+  /* Resolve the PO "entered by" person to an employee id + name (used when no requisition exists) */
+  SELECT
+      h.business_unit,
+      h.po_id,
+      pe.emplid AS entered_by_worker_id,
+      pd.first_name,
+      pd.last_name
+  FROM open_pos op
+  JOIN hdr_candidates h
+    ON h.business_unit = op.business_unit
+   AND h.po_id         = op.po_id
+  LEFT JOIN psoprdefn pe
+    ON pe.oprid = h.oprid_entered_by
+  LEFT JOIN ps_personal_data pd
+    ON pd.emplid = pe.emplid
+),
+doug_person AS (
+  /* Service POs must always be assigned to Doug Kolpak */
+  SELECT
+      MIN(emplid) AS doug_worker_id,
+      'Doug Kolpak' AS doug_name
+  FROM ps_personal_data
+  WHERE UPPER(first_name) = 'DOUG'
+    AND UPPER(last_name)  = 'KOLPAK'
+),
+
+/* ------------------------------
    wd_comp single-row (prevents duplication)
    ------------------------------ */
 wd_comp AS (
@@ -523,11 +568,27 @@ SELECT
       NULL                   AS "Default Tax Code",
       'Phone'                AS "Issue Option",
       'Y'                    AS "Buyer Is Employee",
-      CASE WHEN us.bh_xwlk_t1 IS NULL THEN '216749' ELSE us.bh_xwlk_t1 END AS "Buyer Worker ID",
+      CASE
+          /* 1) If the PO is Service -> always Doug */
+          WHEN ppt.potype = 'Service' THEN COALESCE(TO_CHAR(dp.doug_worker_id), '216749')
+          /* 2) If NOT Service and no requisition exists -> PO entered-by */
+          WHEN COALESCE(pr.has_req, 0) = 0 THEN COALESCE(TO_CHAR(ep.entered_by_worker_id), '216749')
+          /* 3) If requisition exists -> cost-center (OU+Dept) buyer mapping, else default */
+          WHEN us.bh_xwlk_t1 IS NULL THEN '216749'
+          ELSE us.bh_xwlk_t1
+      END AS "Buyer Worker ID",
       'Y'                    AS "Bill To Contact Is Employee",
-      CASE WHEN us.bh_xwlk_t1 IS NULL THEN '216749' ELSE us.bh_xwlk_t1 END AS "Bill To Contact Worker ID",
-      CASE WHEN us.bh_xwlk_t1 IS NULL THEN 'Christie Lockman'
-           ELSE us.first_name || ' ' || us.last_name
+      CASE
+          WHEN ppt.potype = 'Service' THEN COALESCE(TO_CHAR(dp.doug_worker_id), '216749')
+          WHEN COALESCE(pr.has_req, 0) = 0 THEN COALESCE(TO_CHAR(ep.entered_by_worker_id), '216749')
+          WHEN us.bh_xwlk_t1 IS NULL THEN '216749'
+          ELSE us.bh_xwlk_t1
+      END AS "Bill To Contact Worker ID",
+      CASE
+          WHEN ppt.potype = 'Service' THEN dp.doug_name
+          WHEN COALESCE(pr.has_req, 0) = 0 THEN COALESCE(ep.first_name || ' ' || ep.last_name, 'Christie Lockman')
+          WHEN us.bh_xwlk_t1 IS NULL THEN 'Christie Lockman'
+          ELSE us.first_name || ' ' || us.last_name
       END                    AS "Bill To Contact Detail",
       NULL                   AS "Bill To Address",
       wd_comp.bh_xwlk_t1     AS "Bill To Address ID",
@@ -609,5 +670,12 @@ LEFT JOIN buyer_userid us
 LEFT JOIN Req_name r
   ON r.business_unit = h.business_unit
  AND r.po_id         = h.po_id
+CROSS JOIN doug_person dp
+LEFT JOIN po_req_flag pr
+  ON pr.business_unit = h.business_unit
+ AND pr.po_id         = h.po_id
+LEFT JOIN entered_by_person ep
+  ON ep.business_unit = h.business_unit
+ AND ep.po_id         = h.po_id
 CROSS JOIN wd_comp
 ORDER BY h.business_unit, h.po_id
