@@ -427,3 +427,155 @@ FROM service_worktags_8011501
 WHERE no LIKE 'PO-%'
 LIMIT 200;
 
+/* ------------------------------
+   Additional reconciliation summaries (requested)
+   ------------------------------ */
+
+-- 40) PO set reconciliation metrics (Header vs Goods UNION Service)
+WITH
+hdr_pos AS (
+  SELECT DISTINCT no AS po_id
+  FROM po_header
+),
+line_pos AS (
+  SELECT DISTINCT no AS po_id FROM goods_po_line
+  UNION
+  SELECT DISTINCT no AS po_id FROM service_po_line
+)
+SELECT metric, val
+FROM (
+  SELECT 'HDR_DISTINCT_PO' AS metric, COUNT(*)::BIGINT AS val FROM hdr_pos
+  UNION ALL
+  SELECT 'LINES_DISTINCT_PO(goods∪service)', COUNT(*)::BIGINT FROM line_pos
+  UNION ALL
+  SELECT 'LINES_MINUS_HDR (must be 0)',
+         (SELECT COUNT(*)::BIGINT FROM (SELECT po_id FROM line_pos EXCEPT SELECT po_id FROM hdr_pos))
+  UNION ALL
+  SELECT 'HDR_MINUS_LINES (must be 0)',
+         (SELECT COUNT(*)::BIGINT FROM (SELECT po_id FROM hdr_pos EXCEPT SELECT po_id FROM line_pos))
+)
+ORDER BY metric;
+
+-- 41) List POs in lines but missing in header (must be empty)
+WITH
+hdr_pos AS (SELECT DISTINCT no AS po_id FROM po_header),
+line_pos AS (
+  SELECT DISTINCT no AS po_id FROM goods_po_line
+  UNION
+  SELECT DISTINCT no AS po_id FROM service_po_line
+)
+SELECT po_id
+FROM (SELECT po_id FROM line_pos EXCEPT SELECT po_id FROM hdr_pos)
+ORDER BY po_id
+LIMIT 200;
+
+-- 42) List POs in header but missing in lines (must be empty)
+WITH
+hdr_pos AS (SELECT DISTINCT no AS po_id FROM po_header),
+line_pos AS (
+  SELECT DISTINCT no AS po_id FROM goods_po_line
+  UNION
+  SELECT DISTINCT no AS po_id FROM service_po_line
+)
+SELECT po_id
+FROM (SELECT po_id FROM hdr_pos EXCEPT SELECT po_id FROM line_pos)
+ORDER BY po_id
+LIMIT 200;
+
+-- 43) Overlap: same PO appears in both goods and service (count; should be 0 if PO-level split)
+WITH
+g AS (SELECT DISTINCT no AS po_id FROM goods_po_line),
+s AS (SELECT DISTINCT no AS po_id FROM service_po_line)
+SELECT COUNT(*)::BIGINT AS overlap_po_cnt
+FROM (SELECT po_id FROM g INTERSECT SELECT po_id FROM s);
+
+-- 44) Overlap: same PO+Line appears in both goods and service (must be 0 always)
+WITH
+g AS (SELECT no AS po_id, line_number AS line_nbr FROM goods_po_line),
+s AS (SELECT no AS po_id, line_number AS line_nbr FROM service_po_line)
+SELECT COUNT(*)::BIGINT AS overlap_po_line_cnt
+FROM (SELECT po_id, line_nbr FROM g INTERSECT SELECT po_id, line_nbr FROM s);
+
+-- 45) Worktags PO-set reconciliation vs Lines PO-set
+WITH
+line_pos AS (
+  SELECT DISTINCT no AS po_id FROM goods_po_line
+  UNION
+  SELECT DISTINCT no AS po_id FROM service_po_line
+),
+wt_pos AS (
+  SELECT DISTINCT no AS po_id FROM good_worktags_8011501
+  UNION
+  SELECT DISTINCT no AS po_id FROM service_worktags_8011501
+)
+SELECT metric, val
+FROM (
+  SELECT 'WT_DISTINCT_PO' AS metric, COUNT(*)::BIGINT AS val FROM wt_pos
+  UNION ALL
+  SELECT 'WT_MINUS_LINES (should be 0 or explainable)',
+         (SELECT COUNT(*)::BIGINT FROM (SELECT po_id FROM wt_pos EXCEPT SELECT po_id FROM line_pos))
+  UNION ALL
+  SELECT 'LINES_MINUS_WT (should be 0 if every line has a worktag row)',
+         (SELECT COUNT(*)::BIGINT FROM (SELECT po_id FROM line_pos EXCEPT SELECT po_id FROM wt_pos))
+)
+ORDER BY metric;
+
+-- 46) Goods: Item present but Resource Category populated (should be 0 per rule)
+SELECT
+  no AS po_no,
+  line_number,
+  item AS inventory_item_id,
+  resource_category
+FROM goods_po_line
+WHERE COALESCE(TRIM(item), '') <> ''
+  AND COALESCE(TRIM(resource_category), '') <> ''
+ORDER BY po_no, line_number
+LIMIT 200;
+
+-- 47) Service buyer override: Service POs not assigned to Doug by Bill To Contact Detail (should be 0)
+SELECT
+  no AS po_no,
+  purchase_order_type,
+  buyer_worker_id,
+  bill_to_contact_worker_id,
+  bill_to_contact_detail
+FROM po_header
+WHERE purchase_order_type = 'Service'
+  AND COALESCE(TRIM(bill_to_contact_detail), '') <> 'Doug Kolpak'
+ORDER BY po_no
+LIMIT 200;
+
+-- 48) Service buyer override: Buyer/Bill-to worker ids should match (should be 0)
+SELECT
+  no AS po_no,
+  purchase_order_type,
+  buyer_worker_id,
+  bill_to_contact_worker_id,
+  bill_to_contact_detail
+FROM po_header
+WHERE purchase_order_type = 'Service'
+  AND COALESCE(TRIM(buyer_worker_id), '') <> COALESCE(TRIM(bill_to_contact_worker_id), '')
+ORDER BY po_no
+LIMIT 200;
+
+-- 49) Amount tolerance sanity: goods lines with Extended Amount between 0 and 1 (review list)
+SELECT
+  no AS po_no,
+  line_number AS line_nbr,
+  extended_amount
+FROM goods_po_line
+WHERE extended_amount > 0
+  AND extended_amount <= 1
+ORDER BY extended_amount ASC
+LIMIT 200;
+
+-- 50) Amount tolerance sanity: service lines with Extended Amount between 0 and 1 (review list)
+SELECT
+  no AS po_no,
+  line_number AS line_nbr,
+  extended_amount
+FROM service_po_line
+WHERE extended_amount > 0
+  AND extended_amount <= 1
+ORDER BY extended_amount ASC
+LIMIT 200;
