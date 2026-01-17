@@ -210,6 +210,36 @@ def _extract_section(full_sql: str, start_marker: str, end_marker: str) -> str:
             marker_line_start = prev_line_start
 
     a = marker_line_start
+
+    # Similar issue on the end marker: if the marker is inside a comment like "/* 2) ORACLE SECTION */",
+    # `b` points at the "2" and we'd otherwise leave a dangling "/* " at the end of the DuckDB section.
+    # Trim the DuckDB section to the *start of the line* containing the end marker.
+    end_line_start = s.rfind("\n", 0, b)
+    end_line_start = (end_line_start + 1) if end_line_start >= 0 else 0
+
+    # Also handle the 2-line variant:
+    #   /*
+    #   2) ORACLE SECTION */
+    # If the previous line opened a block comment and didn't close it, trim to the previous line start.
+    if end_line_start > 0:
+        prev_end = end_line_start - 1
+        prev_start = s.rfind("\n", 0, prev_end)
+        prev_start = (prev_start + 1) if prev_start >= 0 else 0
+        prev_line = s[prev_start:prev_end]
+        this_end = s.find("\n", end_line_start)
+        this_end = this_end if this_end >= 0 else len(s)
+        this_line = s[end_line_start:this_end]
+        prev_strip = prev_line.strip()
+        this_strip = this_line.strip()
+        if (
+            this_strip.startswith(end_marker)
+            and "/*" in prev_strip
+            and "*/" not in prev_strip
+            and "*/" in this_strip
+        ):
+            end_line_start = prev_start
+
+    b = end_line_start
     return s[a:b]
 
 
