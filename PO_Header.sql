@@ -21,7 +21,6 @@ hdr_candidates AS (
   FROM ps_po_hdr h
   CROSS JOIN params p
   WHERE h.po_dt <= p.asof_dt
-    AND h.po_dt >= p.lookback_dt
     AND h.po_status NOT IN ('C','X')
     AND h.vendor_id <> '2000017041' -- and h.po_id='0002800649'
 ),
@@ -616,7 +615,50 @@ END as bill_to_contact_name, o.oprid as bill_to_contact
   LEFT JOIN psoprdefn o
     ON o.oprid = x.bh_xwlk_t1  
 ),
-
+/* ------------------------------
+   Buyer assignment helpers
+   ------------------------------ */
+po_req_flag AS (
+  /* has_req = 1 if any PO distrib references a requisition header */
+  SELECT
+      op.business_unit,
+      op.po_id,
+      MAX(CASE WHEN rh.req_id IS NOT NULL THEN 1 ELSE 0 END) AS has_req
+  FROM open_pos op
+  JOIN ps_po_line_distrib d
+    ON d.business_unit = op.business_unit
+   AND d.po_id         = op.po_id
+  LEFT JOIN ps_req_hdr rh
+    ON rh.business_unit = d.business_unit_req
+   AND rh.req_id        = d.req_id
+  GROUP BY op.business_unit, op.po_id
+),
+entered_by_person AS (
+  /* Resolve the PO "entered by" person to an employee id + name (used when no requisition exists) */
+  SELECT
+      h.business_unit,
+      h.po_id,
+      pe.emplid AS entered_by_worker_id,
+      pd.first_name,
+      pd.last_name
+  FROM open_pos op
+  JOIN hdr_candidates h
+    ON h.business_unit = op.business_unit
+   AND h.po_id         = op.po_id
+  LEFT JOIN psoprdefn pe
+    ON pe.oprid = h.oprid_entered_by
+  LEFT JOIN ps_personal_data pd
+    ON pd.emplid = pe.emplid
+),
+doug_person AS (
+  /* Service POs must always be assigned to Doug Kolpak */
+  SELECT
+      MIN(emplid) AS doug_worker_id,
+      'Doug Kolpak' AS doug_name
+  FROM ps_personal_data
+  WHERE UPPER(first_name) = 'DOUG'
+    AND UPPER(last_name)  = 'KOLPAK'
+),
 /* ------------------------------
    wd_comp single-row (prevents duplication)
    ------------------------------ */
@@ -669,29 +711,81 @@ SELECT --r.req_id,
       NULL                   AS "Default Tax Code",
       'Phone'                AS "Issue Option",
       'Y'                    AS "Buyer Is Employee",
-      CASE WHEN us.bh_xwlk_t1 IS NULL THEN '216749' ELSE us.bh_xwlk_t1 END AS "Buyer Worker ID",
+     /* old CASE WHEN us.bh_xwlk_t1 IS NULL THEN '216749' ELSE us.bh_xwlk_t1 END AS "Buyer Worker ID",*/
+       CASE
+          WHEN ppt.potype = 'Service' THEN COALESCE(TO_CHAR(dp.doug_worker_id), '216749')
+          WHEN COALESCE(pr.has_req, 0) = 0 THEN COALESCE(TO_CHAR(ep.entered_by_worker_id), '216749')
+          WHEN us.bh_xwlk_t1 IS NULL THEN '216749'
+          ELSE us.bh_xwlk_t1
+      END AS "Buyer Worker ID",
       'Y'                    AS "Bill To Contact Is Employee",
-      CASE WHEN us.bh_xwlk_t1 IS NULL THEN '216749' ELSE us.bh_xwlk_t1 END AS "Bill To Contact Worker ID",
-      CASE WHEN us.bh_xwlk_t1 IS NULL THEN 'Christie Lockman'
-        
-
-           ELSE nvl(us.bill_to_contact_name,'Gwinda I Fay')
+      
+     /* old    CASE WHEN us.bh_xwlk_t1 IS NULL THEN '216749' ELSE us.bh_xwlk_t1 END AS "Bill To Contact Worker ID",*/
+      CASE
+          WHEN ppt.potype = 'Service' THEN COALESCE(TO_CHAR(dp.doug_worker_id), '216749')
+          WHEN COALESCE(pr.has_req, 0) = 0 THEN COALESCE(TO_CHAR(ep.entered_by_worker_id), '216749')
+          WHEN us.bh_xwlk_t1 IS NULL THEN '216749'
+          ELSE us.bh_xwlk_t1
+      END AS "Bill To Contact Worker ID",
+      
+   /*old CASE WHEN us.bh_xwlk_t1 IS NULL THEN 'Christie Lockman'
+              ELSE nvl(us.bill_to_contact_name,'Gwinda I Fay')
+      END                    AS "Bill To Contact Detail",*/
+      
+       CASE
+          WHEN ppt.potype = 'Service' THEN dp.doug_name
+          WHEN COALESCE(pr.has_req, 0) = 0 THEN COALESCE(ep.first_name || ' ' || ep.last_name, 'Christie Lockman')
+          WHEN us.bh_xwlk_t1 IS NULL THEN 'Christie Lockman'
+          ELSE us.bill_to_contact_name
       END                    AS "Bill To Contact Detail",
+      
       NULL                   AS "Bill To Address",
       wd_comp.bh_xwlk_t1     AS "Bill To Address ID",
       'Y'                    AS "Ship To Contact Is Employee",
     
      -- nvl(trim(r.requestor_id), h.oprid_entered_by) as "Ship To Contact Worker ID",
      
-     nvl(trim(r.requestor_id), opr.emplid) as "Ship To Contact Worker ID",
+    /* nvl(trim(r.requestor_id), opr.emplid) as "Ship To Contact Worker ID",*/
+     CASE
+          --WHEN ppt.potype = 'Service' THEN dp.doug_worker_id), '216749')
+          WHEN nullif(TRIM(r.requestor_id), '') IS NOT NULL THEN
+              TRIM(r.requestor_id)
+          WHEN nullif(TRIM(opr.emplid), '') IS NOT NULL THEN
+              opr.emplid
+          WHEN nullif(TRIM(us.bh_xwlk_t1), '') IS NOT NULL THEN
+              us.bh_xwlk_t1
+          ELSE
+              '305387'
+      END AS "Ship To Contact Worker ID ", 
      -- opr.oprdefndesc       
-       nvl(trim(r.ship_to_contact_detail), case WHEN INSTR(opr.oprdefndesc, ',') > 0 THEN
+     /*old   nvl(trim(r.ship_to_contact_detail), case WHEN INSTR(opr.oprdefndesc, ',') > 0 THEN
        TRIM(SUBSTR(opr.oprdefndesc, INSTR(opr.oprdefndesc, ',') + 1))
     || ' '
-    || TRIM(SUBSTR(opr.oprdefndesc, 1, INSTR(opr.oprdefndesc), ',') - 1))
+    || TRIM(SUBSTR(opr.oprdefndesc, 1, INSTR(opr.oprdefndesc, ',') - 1))
   ELSE
     opr.oprdefndesc
-END ) AS "Ship To Contact Detail",
+END )						 AS "Ship To Contact Detail",*/
+
+    CASE
+          WHEN nullif(TRIM(r.requestor_id), '') IS NOT NULL THEN
+              TRIM(r.ship_to_contact_detail)
+          WHEN nullif(TRIM(opr.emplid), '') IS NOT NULL THEN
+              (
+                  CASE
+                      WHEN instr(opr.oprdefndesc, ',') > 0 THEN
+                          TRIM(substr(opr.oprdefndesc, instr(opr.oprdefndesc, ',') + 1))
+                          || ' '
+                             || TRIM(substr(opr.oprdefndesc, 1, instr(opr.oprdefndesc, ',') - 1))
+                      ELSE
+                          opr.oprdefndesc
+                  END
+              )
+          WHEN us.bh_xwlk_t1 IS NOT NULL
+               AND TRIM(us.bh_xwlk_t1) <> '' THEN
+              us.bill_to_contact_name
+          ELSE
+              'Angela M Rawlings'
+      END AS  "Ship To Contact Detail",
       ' '                    AS "Ship To Address",
       initcap('SHIP_TO_'
               || replace(trim(substr(sh_loc.address1, 1, 11))
@@ -769,5 +863,13 @@ LEFT JOIN Req_name r
   ON r.business_unit = h.business_unit
  AND r.po_id         = h.po_id
 CROSS JOIN wd_comp
+-- new joins from here 
+CROSS JOIN doug_person dp
+LEFT JOIN po_req_flag pr
+  ON pr.business_unit = h.business_unit
+ AND pr.po_id         = h.po_id
+LEFT JOIN entered_by_person ep
+  ON ep.business_unit = h.business_unit
+ AND ep.po_id         = h.po_id
 --where h.po_id='0002549389'
 ORDER BY h.business_unit, h.po_id

@@ -21,9 +21,15 @@ Workflow:
 - Paste the PO list into the Oracle section (duckdb_po_list CTE) and run in SQL Developer.
 */
 
+/* 1) DUCKDB SECTION */
 /* =====================================================================
-   1) DUCKDB SECTION (run in DuckDB against extracts.duckdb)
+   DuckDB section (run in DuckDB against extracts.duckdb)
    ===================================================================== */
+
+-- IMPORTANT (for bh_oracle_extracts/run_grand_recon.py):
+-- - This section may contain MANY DuckDB statements.
+-- - The *LAST* DuckDB statement MUST return exactly one column named "po_id".
+--   The program uses that last result set as the PO list to feed into Oracle.
 
 -- 1.1) Distinct PO counts (header vs lines)
 WITH
@@ -118,8 +124,8 @@ FROM u
 LEFT JOIN g ON g.po_id = u.po_id
 LEFT JOIN s ON s.po_id = u.po_id;
 
--- 1.3) PO list for Oracle (copy/paste output into Oracle CTE below)
--- NOTE: DuckDB result is a 1-column list; paste into Oracle using UNION ALL SELECT ... FROM dual.
+-- 1.3) PO list for Oracle (program consumes this; KEEP THIS AS THE LAST STATEMENT IN DUCKDB SECTION)
+-- NOTE: DuckDB result is a 1-column list; program binds it into Oracle as SYS.ODCIVARCHAR2LIST.
 WITH line_pos AS (
   SELECT DISTINCT no AS po_id FROM goods_po_line
   UNION
@@ -130,8 +136,9 @@ FROM line_pos
 ORDER BY po_id;
 
 
+/* 2) ORACLE SECTION */
 /* =====================================================================
-   2) ORACLE SECTION (run in Oracle SQL Developer)
+   Oracle section (run in Oracle SQL Developer)
    ===================================================================== */
 
 /* 2.0) Paste DuckDB PO list here:

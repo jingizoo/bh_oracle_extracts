@@ -177,6 +177,14 @@ def _extract_section(full_sql: str, start_marker: str, end_marker: str) -> str:
     b = s.find(end_marker, a)
     if b < 0:
         raise ValueError(f"End marker not found: {end_marker!r}")
+    # If the marker appears mid-line (e.g., inside a comment like "/* 1) DUCKDB SECTION */"),
+    # rewind to the start of that line so we keep the comment token. This prevents DuckDB
+    # from trying to parse a bare leading "1) ..." token.
+    line_start = s.rfind("\n", 0, a)
+    if line_start >= 0:
+        a = line_start + 1
+    else:
+        a = 0
     return s[a:b]
 
 
