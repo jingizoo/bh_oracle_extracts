@@ -579,5 +579,7 @@ SELECT
 FROM service_po_line
 WHERE COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) > 0.0
   AND COALESCE(try_cast(extended_amount AS DOUBLE), 0.0) <= 1.0
+  COALESCE(try_cast(quantity AS DOUBLE), 0.0) > 0.0
+  AND COALESCE(try_cast(quantity AS DOUBLE), 0.0) <= 1.0
 ORDER BY extended_amount_num ASC
 LIMIT 200;
