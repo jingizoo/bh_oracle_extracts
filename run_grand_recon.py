@@ -178,13 +178,38 @@ def _extract_section(full_sql: str, start_marker: str, end_marker: str) -> str:
     if b < 0:
         raise ValueError(f"End marker not found: {end_marker!r}")
     # If the marker appears mid-line (e.g., inside a comment like "/* 1) DUCKDB SECTION */"),
-    # rewind to the start of that line so we keep the comment token. This prevents DuckDB
+    # rewind to the start of that line so we keep any comment token. This prevents DuckDB
     # from trying to parse a bare leading "1) ..." token.
-    line_start = s.rfind("\n", 0, a)
-    if line_start >= 0:
-        a = line_start + 1
-    else:
-        a = 0
+    #
+    # Also handle the 2-line variant:
+    #   /*
+    #   1) DUCKDB SECTION */
+    # In that case, the marker line does not include "/*", so we rewind one more line if it
+    # looks like we're inside an unterminated block comment.
+    marker_line_start = s.rfind("\n", 0, a)
+    marker_line_start = (marker_line_start + 1) if marker_line_start >= 0 else 0
+
+    # If previous line opened a block comment and didn't close it, include it too.
+    if marker_line_start > 0:
+        prev_line_end = marker_line_start - 1  # the '\n' char
+        prev_line_start = s.rfind("\n", 0, prev_line_end)
+        prev_line_start = (prev_line_start + 1) if prev_line_start >= 0 else 0
+        prev_line = s[prev_line_start:prev_line_end]
+        this_line_end = s.find("\n", marker_line_start)
+        this_line_end = this_line_end if this_line_end >= 0 else len(s)
+        this_line = s[marker_line_start:this_line_end]
+
+        prev_strip = prev_line.strip()
+        this_strip = this_line.strip()
+        if (
+            this_strip.startswith(start_marker)
+            and "/*" in prev_strip
+            and "*/" not in prev_strip
+            and "*/" in this_strip
+        ):
+            marker_line_start = prev_line_start
+
+    a = marker_line_start
     return s[a:b]
 
 
@@ -294,6 +319,18 @@ def main() -> int:
 
     full_sql = open(sql_path, "r", encoding="utf-8").read()
     duckdb_section = _extract_section(full_sql, "1) DUCKDB SECTION", "2) ORACLE SECTION")
+    # Defensive: if a SQL file has a marker like:
+    #   /*
+    #   1) DUCKDB SECTION */
+    # some older versions (or manual edits) can still cause the extracted section to begin
+    # with a bare "1) ..." line. DuckDB cannot parse that, so comment it out.
+    # (This is safe: the marker line is not intended to be executable SQL.)
+    duckdb_section_lstripped = duckdb_section.lstrip()
+    if duckdb_section_lstripped.startswith("1) DUCKDB SECTION"):
+        lines = duckdb_section.splitlines(True)
+        if lines:
+            lines[0] = "-- " + lines[0]
+            duckdb_section = "".join(lines)
     duckdb_stmts = split_sql_statements(duckdb_section)
     if not duckdb_stmts:
         raise SystemExit("No DuckDB statements found in grand_recon.sql")
