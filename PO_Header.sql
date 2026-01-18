@@ -141,7 +141,7 @@ sched_open AS (
 
   WHEN x.amt_only_flg = 'Y' THEN
     CASE
-      WHEN GREATEST(NVL(x.sched_amt,0) - NVL(x.merch_amt_vchr,0), 0) > 1
+      WHEN GREATEST(NVL(x.sched_amt,0) - NVL(x.merch_amt_vchr,0), 0) > 1 and (sched_amt)>0
       THEN 1 ELSE 0
     END
 
@@ -736,7 +736,7 @@ SELECT --r.req_id,
           WHEN ppt.potype = 'Service' THEN dp.doug_name
           WHEN COALESCE(pr.has_req, 0) = 0 THEN COALESCE(ep.first_name || ' ' || ep.last_name, 'Christie Lockman')
           WHEN us.bh_xwlk_t1 IS NULL THEN 'Christie Lockman'
-          ELSE us.bill_to_contact_name
+          ELSE nvl(us.bill_to_contact_name,'Gwinda I Fay')
       END                    AS "Bill To Contact Detail",
       
       NULL                   AS "Bill To Address",
@@ -756,7 +756,7 @@ SELECT --r.req_id,
               us.bh_xwlk_t1
           ELSE
               '305387'
-      END AS "Ship To Contact Worker ID ", 
+      END AS "Ship To Contact Worker ID", 
      -- opr.oprdefndesc       
      /*old   nvl(trim(r.ship_to_contact_detail), case WHEN INSTR(opr.oprdefndesc, ',') > 0 THEN
        TRIM(SUBSTR(opr.oprdefndesc, INSTR(opr.oprdefndesc, ',') + 1))

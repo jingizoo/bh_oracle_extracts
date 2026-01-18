@@ -525,7 +525,7 @@ SELECT --b.shipto_id,
 
     ' '                                                         AS "Deliver To Location GLN",
     ' '                                                         AS "Deliver To Location Location Id",
-    TRIM(b.cntrct_id)                                           AS "Supplier Contract",
+    ' '                                                         AS "Supplier Contract",
     ' '                                                         AS "Storage Location",
    ' '                                         AS "Close Status"
 FROM base b
