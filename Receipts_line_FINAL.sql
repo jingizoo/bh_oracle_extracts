@@ -1,3 +1,5 @@
+
+
 WITH params AS (
   SELECT TRUNC(to_date('15-01-2026','DD-MM-YYYY')) AS asof_dt,
          ADD_MONTHS(TRUNC(To_date('15-01-2026','DD-MM-YYYY')), -12) AS lookback_dt
@@ -25,9 +27,19 @@ hdr_candidates AS (
     AND h.vendor_id <> '2000017041' -- and h.po_id='0002800649'
 ),
 
+
 /* ------------------------------
    Receipts to date
    ------------------------------ */
+
+
+
+paid_vouchers AS (
+  SELECT /*+ MATERIALIZE */ DISTINCT px.business_unit, px.voucher_id
+  FROM ps_pymnt_vchr_xref px
+  WHERE px.pymnt_action <> 'X'
+    AND px.paid_amt > 0
+),
 
 vchr_sum_match AS (
   SELECT
@@ -46,11 +58,9 @@ vchr_sum_match AS (
    AND hc.po_id         = vl.po_id
    
    CROSS JOIN PARAMS P
-   JOIN ps_pymnt_vchr_xref px
-   on px.business_unit = v.business_unit
-        AND px.voucher_id    = v.voucher_id
-        AND px.pymnt_action  <> 'X'
-        and px.paid_amt >0
+  JOIN paid_vouchers pv
+    ON pv.business_unit = v.business_unit
+   AND pv.voucher_id    = v.voucher_id
   WHERE v.entry_status <> 'X'
     AND v.match_status_vchr = 'M'
     AND vl.po_id IS NOT NULL
@@ -116,7 +126,7 @@ sched_open AS (
       x.recv_req,
       x.amt_only_flg,
      -- x.qty_rcvd_suom,
-   --   x.merch_amt_rcvd_po,
+    --  x.merch_amt_rcvd_po,
       x.merch_amt_vchr,
       x.sched_amt,
       x.qty_vchr,
@@ -160,8 +170,8 @@ END AS is_open
         s.liquidate_method,
         lf.recv_req,
         lf.amt_only_flg,
-      --  NVL(r.qty_rcvd_suom, 0)     AS qty_rcvd_suom,
-        --NVL(r.merch_amt_rcvd_po, 0) AS merch_amt_rcvd_po,
+     --   NVL(r.qty_rcvd_suom, 0)     AS qty_rcvd_suom,
+      --  NVL(r.merch_amt_rcvd_po, 0) AS merch_amt_rcvd_po,
         NVL(vs.merch_amt_vchr, 0)   AS merch_amt_vchr,
         NVL(s.merchandise_amt, NVL(s.qty_po,0) * NVL(s.price_po,0)) AS sched_amt,
            NVL (vs.qty_vchr,0) as qty_vchr
@@ -173,11 +183,7 @@ END AS is_open
       ON lf.business_unit = s.business_unit
      AND lf.po_id         = s.po_id
      AND lf.line_nbr      = s.line_nbr
-  /*  LEFT JOIN recv_agg r
-      ON r.business_unit  = s.business_unit
-     AND r.po_id          = s.po_id
-     AND r.line_nbr       = s.line_nbr
-     AND r.sched_nbr      = s.sched_nbr*/
+   
     LEFT JOIN vchr_sum_match vs
       ON vs.business_unit = s.business_unit
      AND vs.po_id         = s.po_id
@@ -254,103 +260,196 @@ open_po_eligible AS (
    GROUP BY so.business_unit, so.po_id
 ),
 
-/* open_pos stays PO-level */
+/* ------------------------------
+   Lookback activity
+   ------------------------------ */
+
+
+/* ------------------------------
+   Open POs in scope
+   ------------------------------ */
 open_pos AS (
-  SELECT /*+ MATERIALIZE */ DISTINCT hc.business_unit, hc.po_id
+  SELECT /*+ MATERIALIZE */
+         hc.business_unit,
+         hc.po_id
   FROM hdr_candidates hc
   CROSS JOIN params p
-  JOIN open_po_eligible ope
-    ON ope.business_unit = hc.business_unit
-   AND ope.po_id         = hc.po_id
-  WHERE hc.po_dt >= p.lookback_dt
- AND NVL(hc.buyer_id,' ') <> 'BILLONLY'  
-    AND EXISTS (SELECT 1 FROM ps_bh_wd_sup_1to1 wd WHERE wd.bh_wd_ps_vendor_id = hc.vendor_id)
-    AND EXISTS (SELECT 1 FROM ps_bus_unit_tbl_pm bu WHERE bu.business_unit = hc.business_unit)
-      and exists(  select 1 from po_has_pos_amt_and_qty p   WHERE p.business_unit = hc.business_unit    AND p.po_id  = hc.po_id)
+  
+  WHERE EXISTS (
+    SELECT 1
+      FROM open_po_eligible ope
+     WHERE ope.business_unit = hc.business_unit
+       AND ope.po_id         = hc.po_id
+  )
+  AND (
+       hc.po_dt >= p.lookback_dt
+         AND NVL(hc.buyer_id,' ') <> 'BILLONLY'  )
+  and exists(
+  select 1 from po_has_pos_amt_and_qty p
+   WHERE p.business_unit = hc.business_unit
+       AND p.po_id         = hc.po_id
+)
 ),
-dist_agg AS (
-  SELECT
-    rld.business_unit,
-    rld.receiver_id,
+/* Final PO population = header PO set (no extra lookback ORs) */
+included_po AS (
+  SELECT /*+ MATERIALIZE */ DISTINCT op.business_unit, op.po_id,   l.line_nbr,
+         s.sched_nbr
+    FROM open_pos op
+JOIN ps_po_hdr h
+    ON h.business_unit = op.business_unit 
+   AND h.po_id         = op.po_id
+  JOIN ps_po_line l
+    ON l.business_unit = op.business_unit
+   AND l.po_id         = op.po_id
+  -- AND l.physical_nature = 'G' 
+   and l.recv_req <> 'X'
+  JOIN ps_po_line_ship s
+    ON s.business_unit = l.business_unit
+   AND s.po_id         = l.po_id
+   AND s.line_nbr      = l.line_nbr
+ WHERE l.cancel_status <> 'X'
+    AND s.cancel_status <> 'X'
 
-    MAX(rld.business_unit_gl) KEEP (DENSE_RANK FIRST
-      ORDER BY rld.recv_ln_nbr, rld.recv_ship_seq_nbr, rld.distrib_line_num) AS company
-
-  FROM ps_recv_ln_ship q 
-  /* restrict distribs to qualifying receipt schedules */
-JOIN open_pos op
-  ON op.business_unit = q.business_unit_po
- AND op.po_id         = q.po_id
-  JOIN ps_recv_ln_distrib rld
-    ON q.business_unit      = rld.business_unit
-   AND q.receiver_id        = rld.receiver_id
-   AND q.recv_ln_nbr        = rld.recv_ln_nbr
-   AND q.recv_ship_seq_nbr  = rld.recv_ship_seq_nbr
-
-  WHERE rld.recv_ds_status not in ('C', 'X')
-    AND rld.dst_acct_type = 'DST'
-  GROUP BY rld.business_unit, rld.receiver_id
+),
+shipto_setid_by_bu AS (
+  SELECT r.setcntrlvalue AS business_unit, MAX(r.setid) AS shipto_setid
+  FROM ps_set_cntrl_rec r
+  WHERE r.recname = 'SHIPTO_TBL'
+  GROUP BY r.setcntrlvalue
+),
+shipto_ed AS (
+  SELECT st.setid, st.shipto_id, st.descr
+  FROM ps_shipto_tbl st
+  WHERE st.eff_status = 'A'
+    AND st.effdt = (
+      SELECT MAX(st2.effdt)
+      FROM ps_shipto_tbl st2
+      WHERE st2.setid     = st.setid
+        AND st2.shipto_id = st.shipto_id
+        AND st2.effdt    <= SYSDATE
+    )
+),
+     agg AS (
+    SELECT
+        rls.business_unit,
+        rls.receiver_id,
+        rls.recv_ln_nbr,
+        rls.recv_ship_seq_nbr,
+        rls.business_unit_po,
+        rls.po_id,
+        rls.line_nbr,
+        rls.sched_nbr,
+        rld.operating_unit,
+        rls.po_id AS po_no,
+        MAX(rls.inv_item_id) AS inv_item_id,
+        MAX(GREATEST(NVL(rls.qty_sh_recvd,0) - NVL(vsr.qty_vchr,0), 0)) AS qty_sh_recvd,
+        MAX(rls.receive_uom) AS receive_uom,
+        MAX(rls.shipto_id) AS shipto_id,
+        MAX(rls.descr254_mixed) AS recv_descr,
+      /*  MAX(pl.cntrct_id) AS cntrct_id,
+        MAX(pl.cntrct_line_nbr) AS cntrct_line_nbr,
+        MAX(pl.physical_nature) AS physical_nature,*/
+        MAX(rld.business_unit_gl) KEEP(DENSE_RANK FIRST ORDER BY rld.distrib_line_num) AS business_unit_gl,
+        MAX(rld.location) KEEP(DENSE_RANK FIRST ORDER BY rld.distrib_line_num) AS location,
+        MAX(nullif(TRIM(rld.delivery_feedback), '')) KEEP(DENSE_RANK FIRST ORDER BY rld.distrib_line_num) AS delivery_feedback,
+        MAX(
+            CASE
+                WHEN d.deptid = '20100' THEN
+                    1
+                ELSE
+                    0
+            END
+        ) AS has_inventory_dept
+    FROM
+        ps_recv_ln_ship        rls
+        JOIN ps_recv_ln_distrib     rld ON rld.business_unit = rls.business_unit
+                                       AND rld.receiver_id = rls.receiver_id
+                                           AND rld.recv_ln_nbr = rls.recv_ln_nbr
+                                               AND rld.recv_ship_seq_nbr = rls.recv_ship_seq_nbr
+        JOIN included_po   gl ON gl.business_unit = rls.business_unit_po
+                                        AND gl.po_id = rls.po_id
+                                         AND gl.line_nbr = rls.line_nbr
+                                          AND gl.sched_nbr = rls.sched_nbr 
+        LEFT JOIN vchr_sum_match vsr
+          ON vsr.business_unit = rls.business_unit_po
+         AND vsr.po_id         = rls.po_id
+         AND vsr.line_nbr      = rls.line_nbr
+         AND vsr.sched_nbr     = rls.sched_nbr
+     /*   LEFT JOIN ps_po_line             pl ON pl.business_unit = rls.business_unit_po
+                                   AND pl.po_id = rls.po_id
+                                       AND pl.line_nbr = rls.line_nbr*/
+        LEFT JOIN ps_po_line_distrib     d ON d.business_unit = rls.business_unit_po
+                                          AND d.po_id = rls.po_id
+        JOIN params                 p ON 1 = 1
+    WHERE
+        rls.recv_ship_status <> 'X'
+        AND rld.recv_ds_status <> 'X'
+            AND rld.dst_acct_type = 'DST'
+                AND rls.receipt_dttm >= CAST(p.lookback_dt AS TIMESTAMP)
+                    AND rls.receipt_dttm < CAST(p.asof_dt + 1 AS TIMESTAMP)
+        AND GREATEST(NVL(rls.qty_sh_recvd,0) - NVL(vsr.qty_vchr,0), 0) > 0
+    GROUP BY
+        rls.business_unit,
+        rls.receiver_id,
+        rls.recv_ln_nbr,
+        rls.recv_ship_seq_nbr,
+        rls.business_unit_po,
+        rls.po_id,
+        rls.line_nbr,
+        rls.sched_nbr,
+        rld.operating_unit
+), numbered AS (
+    SELECT
+        a.*,
+        ROW_NUMBER() OVER(
+            PARTITION BY a.receiver_id
+            ORDER BY
+                a.recv_ln_nbr, a.recv_ship_seq_nbr
+        ) AS line_seq
+    FROM
+        agg a
 )
 
-SELECT
-  h.receiver_id                                       AS "No",
-  'Y'                                                 AS "Add Only",
-  ' '                                                 AS "Receipt Reference For Update",
-  h.receiver_id                                       AS "Receipt Number",
-  ' '                                                 AS "Locked in Workday",
-  'Y'                                                 AS "Submit",
-
-  NVL(rld.company,' ')                                 AS "Company",
-
-  ' '                                                 AS "Bill of Lading",
-  ' '                                                 AS "Requester",
-  ' '                                                 AS "Requisition",
-  ' '                                                 AS "Tracking Number",
-  ' '                                                 AS "Supplier Order Ref",
-  ' '                                                 AS "Shipment Date Time",
-  ' '                                                 AS "Shipment Contact",
-  ' '                                                 AS "Bill of Lading Quantity",
-  ' '                                                 AS "License Plate",
-  ' '                                                 AS "Shipment Ref",
-  ' '                                                 AS "Document Status",-- h.vendor_id as Supp,
-
-  wd.bh_wd_supplier_id                                AS "Supplier",
-
-  TO_CHAR(h.receipt_dt,'YYYY-MM-DD')                  AS "Document Date",
-  ' '                                                 AS "Last Updated",
-  ' '                                                 AS "Created for Worker ID",
-
- --    ls.requester_oprid||'-'||o.oprdefndesc          AS "Memo",
- ' ' AS "Memo",
-  ' '                                                 AS "Contingent Worker Receipt Purchase Order Line",
-  ' '                                                 AS "Period Start Date",
-  ' '                                                 AS "Period End Date",
-  NULL                                                AS "Additional Amount",
-  ' '                                                 AS "Amount to Receive",
-  ' '                                                 AS "Contingent Worker Receipt Memo"
-
-
-FROM ps_recv_hdr h
---join ps_recv_ln_ship rls
-JOIN (SELECT DISTINCT business_unit, receiver_id,po_id,business_unit_po FROM ps_recv_ln_ship s
-CROSS JOIN params p
-WHERE s.recv_ship_status NOT IN ('C','X','R')
-  AND s.receipt_dttm >= CAST(p.lookback_dt AS TIMESTAMP)
-  AND s.receipt_dttm <  CAST(p.asof_dt + 1 AS TIMESTAMP)) rls
-
- on rls.business_unit = h.business_unit
- AND rls.receiver_id   = h.receiver_id
-JOIN open_pos op
-  ON op.business_unit = rls.business_unit_po
- AND op.po_id         = rls.po_id
-
-left JOIN ps_bh_wd_sup_1to1 wd
-  ON h.vendor_id = wd.bh_wd_ps_vendor_id
-left join  dist_agg rld
- ON rls.business_unit      = rld.business_unit
-   AND rls.receiver_id        = rld.receiver_id
-  
-/*WHERE rls.recv_ship_status NOT IN ('C','X')
-  AND rls.receipt_dttm >= CAST(p.lookback_dt AS TIMESTAMP)
-  AND rls.receipt_dttm <  CAST(p.asof_dt + 1 AS TIMESTAMP)*/
-ORDER BY rls.receiver_id
+SELECT n.receiver_id AS "No",
+         n.receiver_id
+         || '-'
+            || n.line_seq AS "*Item Receipt Line Replacement Line No",
+          n.po_no
+            || '-'
+               || TO_CHAR(n.line_nbr) AS "Purchase Order Line",
+         /*CASE
+             WHEN TRIM(n.cntrct_id) IS NOT NULL
+                  AND TRIM(n.cntrct_id) <> '' THEN
+                 TRIM(n.cntrct_id)
+                 || '-'
+                    || TO_CHAR(n.cntrct_line_nbr)
+             ELSE
+                 ' '
+         END AS "Supplier Contract Line",*/-- not required for P1
+          ' '          AS "Supplier Contract Line",
+         x.bhxlat/*  n.business_unit_gl*/ AS "Line Company",
+         ' ' AS "Packaging String",
+         n.inv_item_id AS "Purchase Item",
+         n.qty_sh_recvd AS "Quantity",
+         n.receive_uom AS "Unit of Measure",
+         CASE
+             WHEN n.has_inventory_dept = 1 THEN
+                 'Inventory Replenishment'
+             ELSE
+                 ' '
+         END AS "Delivery Type",
+         ' ' AS "Ship To Address",
+         ' ' AS "Ship To Contact Worker Type",
+         ' ' AS "Ship To Contact Worker ID",
+         ' ' AS "Deliver To",
+         ' ' AS "Commodity Code",
+         coalesce(n.delivery_feedback, nullif(TRIM(n.recv_descr), ''), ' ') AS "Memo",
+         ' ' AS "Goods Delivery Line"
+FROM numbered n
+LEFT JOIN shipto_setid_by_bu sb ON sb.business_unit = n.business_unit_po
+LEFT JOIN shipto_ed st ON st.setid = sb.shipto_setid
+                          AND st.shipto_id = n.shipto_id
+LEFT JOIN ps_bhxlatitem x ON x.fieldname = 'BH_WD_FDM_OU_COMP'
+                             AND x.bhvalue = n.operating_unit
+--where n.receiver_id='0002597771'
+ORDER BY n.receiver_id,  n.line_seq

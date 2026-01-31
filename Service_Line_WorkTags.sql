@@ -269,7 +269,23 @@ included_service_lines AS (
    AND d.line_nbr      = so.line_nbr
    AND d.sched_nbr     = so.sched_nbr
 ),
+cc_cocnt AS (
+  SELECT
+      BH_WD_PS_OP_UNIT AS ps_op_unit,
+      BH_WD_PS_DEPT    AS ps_deptid,
 
+      /* prefer CO_80800 if duplicates ever exist; otherwise MAX works */
+      MAX(BH_WD_FDM_COST_CNT) KEEP (
+        DENSE_RANK FIRST ORDER BY
+          CASE
+            WHEN BH_WD_FDM_CCT_RSTR IN ('CO_80800','CO 80800') THEN 0
+            ELSE 1
+          END,
+          BH_WD_FDM_CCT_RSTR
+      ) AS wd_cost_center
+  FROM PS_BH_WD_FDM_COCNT
+  GROUP BY BH_WD_PS_OP_UNIT, BH_WD_PS_DEPT
+),
 unpivoted AS (
   SELECT
     po_id,

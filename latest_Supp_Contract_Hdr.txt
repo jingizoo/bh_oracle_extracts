@@ -1,0 +1,430 @@
+WITH
+params AS (
+  SELECT TRUNC(TO_DATE('15-01-2026','DD-MM-YYYY')) AS asof_dt,
+         ADD_MONTHS(TRUNC(TO_DATE('15-01-2026','DD-MM-YYYY')), -12) AS lookback_dt
+  FROM dual
+),
+
+/* --- PO scope (same base filters you use elsewhere) --- */
+hdr_candidates AS (
+  SELECT /*+ MATERIALIZE */
+         h.business_unit,
+         h.po_id,
+         h.po_dt,
+         h.po_status,
+         h.vendor_id,
+         h.currency_cd
+  FROM ps_po_hdr h
+  CROSS JOIN params p
+  WHERE h.po_dt <= p.asof_dt
+    AND h.po_status NOT IN ('C','X')
+    AND h.vendor_id <> '2000017041'
+),
+
+/* Paid vouchers (your â€œpaid existsâ€? definition) */
+paid_vouchers AS (
+  SELECT /*+ MATERIALIZE */ DISTINCT px.business_unit, px.voucher_id
+  FROM ps_pymnt_vchr_xref px
+  WHERE px.pymnt_action <> 'X'
+    AND px.paid_amt > 0
+),
+
+/* Vouchered amounts used to assess openness (count only MATCHED + PAID) */
+vchr_sum_match AS (
+  SELECT
+      vl.business_unit_po AS business_unit,
+      vl.po_id,
+      vl.line_nbr,
+      NVL(vl.sched_nbr, 1) AS sched_nbr,
+      SUM(NVL(vl.merchandise_amt,0)) AS merch_amt_vchr,
+      SUM(NVL(vl.qty_vchr,0))        AS qty_vchr
+  FROM ps_voucher_line vl
+  JOIN ps_voucher v
+    ON v.business_unit = vl.business_unit
+   AND v.voucher_id    = vl.voucher_id
+  JOIN paid_vouchers pv
+    ON pv.business_unit = v.business_unit
+   AND pv.voucher_id    = v.voucher_id
+  JOIN hdr_candidates hc
+    ON hc.business_unit = vl.business_unit_po
+   AND hc.po_id         = vl.po_id
+  CROSS JOIN params p
+  WHERE v.entry_status <> 'X'
+    AND v.match_status_vchr = 'M'
+    AND vl.po_id IS NOT NULL
+    AND vl.po_id <> ' '
+    AND NVL(v.invoice_dt, v.entered_dt) < (p.asof_dt + 1)
+  GROUP BY vl.business_unit_po, vl.po_id, vl.line_nbr, NVL(vl.sched_nbr, 1)
+),
+
+/* PO line flags */
+po_line_flags AS (
+  SELECT l.business_unit,
+         l.po_id,
+         l.line_nbr,
+         NVL(l.recv_req,'Y')     AS recv_req,
+         NVL(l.amt_only_flg,'N') AS amt_only_flg
+  FROM ps_po_line l
+  JOIN hdr_candidates hc
+    ON hc.business_unit = l.business_unit
+   AND hc.po_id         = l.po_id
+),
+
+
+/* Service PO filter (PO-level) */
+service_flags AS (
+  SELECT /*+ LEADING(hc d) USE_NL(d) INDEX(d) */ d.business_unit,
+         d.po_id,
+         CASE WHEN MAX(x.BH_XWLK_t1) IS NOT NULL THEN 'Y' ELSE 'N' END AS has_service
+    FROM hdr_candidates hc
+    JOIN ps_po_line_distrib d
+      ON d.business_unit = hc.business_unit
+     AND d.po_id         = hc.po_id
+    LEFT JOIN PS_BH_XWLK_VAL_TBL x
+      ON x.LONGNAME        = 'WD_ACCT_TO_PO_TYPE'
+     AND x.bh_xwlk_module  = 'PO'
+     AND x.bh_xwlk_track   = 'SCM'
+     AND x.BH_XWLK_S2      = d.account
+   GROUP BY d.business_unit, d.po_id
+),
+sched_open AS (
+  SELECT
+      x.business_unit,
+      x.po_id,
+      x.line_nbr,
+      x.sched_nbr,
+      x.cancel_status,
+      x.due_dt,
+      x.shipto_setid,
+      x.shipto_id,
+      x.freight_terms,
+      x.ship_type_id,
+      x.qty_po,x.price_po,
+      x.merchandise_amt,
+      x.liquidate_method,
+      x.recv_req,
+      x.amt_only_flg,
+     -- x.qty_rcvd_suom,
+    --  x.merch_amt_rcvd_po,
+      x.merch_amt_vchr,
+      x.sched_amt,
+      x.qty_vchr,
+      CASE
+  WHEN NVL(x.cancel_status,' ') IN ('C','X') THEN 0
+
+  WHEN x.amt_only_flg = 'Y' THEN
+    CASE
+      WHEN GREATEST(NVL(x.sched_amt,0) - NVL(x.merch_amt_vchr,0), 0) > 1 and (sched_amt)>0
+      THEN 1 ELSE 0
+    END
+
+  WHEN x.recv_req = 'Y' THEN
+    CASE
+     -- WHEN NVL(x.qty_po,0) > NVL(x.qty_rcvd_suom,0)
+        WHEN NVL(x.qty_po,0) > NVL(x.qty_vchr,0)
+ THEN 1 ELSE 0
+    END
+
+  ELSE
+    CASE
+      WHEN GREATEST(NVL(x.sched_amt,0) - NVL(x.merch_amt_vchr,0), 0) > 1
+      THEN 1 ELSE 0
+    END
+END AS is_open
+  FROM (
+    SELECT /*+ LEADING(hc s) USE_NL(s) INDEX(s) */
+        s.business_unit,
+        s.po_id,
+        s.line_nbr,
+        s.sched_nbr,
+        s.cancel_status,
+        s.due_dt,
+        s.shipto_setid,
+        s.shipto_id,
+        s.freight_terms,
+        s.ship_type_id,
+        s.qty_po,
+        s.price_po,
+        s.merchandise_amt,
+        s.liquidate_method,
+        lf.recv_req,
+        lf.amt_only_flg,
+        --NVL(r.qty_rcvd_suom, 0)     AS qty_rcvd_suom,
+       -- NVL(r.merch_amt_rcvd_po, 0) AS merch_amt_rcvd_po,
+        NVL(vs.merch_amt_vchr, 0)   AS merch_amt_vchr,
+        NVL(s.merchandise_amt, NVL(s.qty_po,0) * NVL(s.price_po,0)) AS sched_amt,
+           NVL (vs.qty_vchr,0) as qty_vchr
+    FROM ps_po_line_ship s
+    JOIN hdr_candidates hc
+      ON hc.business_unit = s.business_unit
+     AND hc.po_id         = s.po_id
+    JOIN po_line_flags lf
+      ON lf.business_unit = s.business_unit
+     AND lf.po_id         = s.po_id
+     AND lf.line_nbr      = s.line_nbr
+   
+    LEFT JOIN vchr_sum_match vs
+      ON vs.business_unit = s.business_unit
+     AND vs.po_id         = s.po_id
+     AND vs.line_nbr      = s.line_nbr
+     AND vs.sched_nbr     = s.sched_nbr
+  ) x
+) ,
+
+po_has_pos_amt_and_qty AS (
+  SELECT
+      so.business_unit,
+      so.po_id
+  FROM sched_open so
+  join SERVICE_FLAGS pt on  so.business_unit=pt.business_unit and
+      so.po_id=pt.po_id
+ WHERE so.is_open = 1
+    /* Amount gate must match line extract logic (extended_amt / remaining_amt) */
+    AND (
+      CASE
+        /* Service POs are always amount-based */
+        WHEN pt.has_service = 'Y'
+          THEN GREATEST(NVL(so.sched_amt, 0) - NVL(so.merch_amt_vchr, 0), 0)
+        /* Goods amt-only lines are amount-based */
+        WHEN NVL(so.amt_only_flg, 'N') = 'Y'
+          THEN GREATEST(NVL(so.sched_amt, 0) - NVL(so.merch_amt_vchr, 0), 0)
+        /* Goods receiving-required lines are receipt-qty based */
+        WHEN NVL(so.recv_req, 'Y') = 'Y'
+          THEN GREATEST(NVL(so.qty_po, 0) - NVL(so.qty_vchr, 0), 0) * NVL(so.price_po, 0)
+        /* Goods non-receiving lines are voucher-qty based */
+        ELSE
+          GREATEST(NVL(so.qty_po, 0) - NVL(so.qty_vchr, 0), 0) * NVL(so.price_po, 0)
+      END
+    ) > 0
+    AND (
+          pt.has_service = 'Y'
+          OR (
+               pt.has_service = 'N'
+               AND (
+                    /* Mirror goods-line logic: qty gate depends on recv_req / amt_only */
+                    NVL(so.amt_only_flg, 'N') = 'Y'
+                    OR (
+                         NVL(so.recv_req, 'Y') = 'Y'
+                         AND GREATEST(NVL(so.qty_po, 0) - NVL(so.qty_vchr, 0), 0) > 0
+                       )
+                    OR (
+                         NVL(so.recv_req, 'Y') <> 'Y'
+                         AND GREATEST(NVL(so.qty_po, 0) - NVL(so.qty_vchr, 0), 0) > 0
+                        )
+                  )
+             )
+        )
+  GROUP BY so.business_unit, so.po_id
+) ,
+
+
+open_po_eligible AS (
+  SELECT /*+ MATERIALIZE */ so.business_unit, so.po_id
+  FROM sched_open so
+  JOIN ps_po_line l
+    ON l.business_unit = so.business_unit
+   AND l.po_id         = so.po_id
+   AND l.line_nbr      = so.line_nbr
+   AND l.cancel_status <> 'X'
+  JOIN ps_po_line_distrib d
+    ON d.business_unit      = so.business_unit
+   AND d.po_id              = so.po_id
+   AND d.line_nbr           = so.line_nbr
+   AND d.sched_nbr          = so.sched_nbr
+   AND d.distrib_ln_status <> 'X'
+  WHERE so.is_open = 1
+  GROUP BY so.business_unit, so.po_id
+),
+
+included_po AS (
+  SELECT /*+ MATERIALIZE */ DISTINCT hc.business_unit, hc.po_id
+  FROM hdr_candidates hc
+  CROSS JOIN params p
+  WHERE hc.po_dt >= p.lookback_dt
+    AND EXISTS (
+      SELECT 1 FROM open_po_eligible ope
+      WHERE ope.business_unit = hc.business_unit
+        AND ope.po_id         = hc.po_id
+    )
+    AND EXISTS (
+      SELECT 1 FROM ps_bh_wd_sup_1to1 wd
+      WHERE wd.bh_wd_ps_vendor_id = hc.vendor_id
+    )
+    AND EXISTS (
+      SELECT 1 FROM ps_bus_unit_tbl_pm bu
+      WHERE bu.business_unit = hc.business_unit
+    )
+	  and exists(
+  		select 1 from po_has_pos_amt_and_qty p
+  		 WHERE p.business_unit = hc.business_unit
+      		 AND p.po_id         = hc.po_id
+		)
+
+),
+
+
+/* Prepaid contracts referenced by included POs */
+prepaid_contracts AS (
+  SELECT /*+ MATERIALIZE */
+         l.cntrct_id,
+         MIN(h.vendor_id)    KEEP (DENSE_RANK FIRST ORDER BY h.po_dt DESC) AS vendor_id,
+         MIN(h.currency_cd)  KEEP (DENSE_RANK FIRST ORDER BY h.po_dt DESC) AS currency_cd,
+        /* MIN(h.po_dt) AS start_dt,
+         MAX(h.po_dt) AS end_dt*/
+          -- Calculate the remaining open amount (what's left after vouchers)
+      -- Same logic we used to determine if something is "open"
+      SUM(
+        CASE
+          WHEN GREATEST( NVL(s.merchandise_amt, NVL(s.qty_po,0)*NVL(s.price_po,0)) - NVL(vs.merch_amt_vchr,0), 0 ) > 1
+          THEN GREATEST( NVL(s.merchandise_amt, NVL(s.qty_po,0)*NVL(s.price_po,0)) - NVL(vs.merch_amt_vchr,0), 0 )
+          ELSE 0
+        END
+      ) AS extended_amt
+
+  FROM included_po ip
+  JOIN ps_po_hdr h
+    ON h.business_unit = ip.business_unit
+   AND h.po_id         = ip.po_id
+  JOIN ps_po_line l
+    ON l.business_unit = h.business_unit
+   AND l.po_id         = h.po_id
+  JOIN ps_cntrct_hdr cnt
+    ON cnt.setid     = 'SHARE'
+   AND cnt.cntrct_id = l.cntrct_id
+   AND cnt.cntrct_style = 'PPD_AMORT'
+   
+   JOIN ps_po_line_ship s
+    ON s.business_unit = l.business_unit
+   AND s.po_id         = l.po_id
+   AND s.line_nbr      = l.line_nbr
+   AND s.cancel_status <> 'X'
+
+  JOIN sched_open so
+    ON so.business_unit = s.business_unit
+   AND so.po_id         = s.po_id
+   AND so.line_nbr      = s.line_nbr
+   AND so.sched_nbr     = s.sched_nbr
+   AND so.is_open       = 1
+
+  LEFT JOIN vchr_sum_match vs
+    ON vs.business_unit = s.business_unit
+   AND vs.po_id         = s.po_id
+   AND vs.line_nbr      = s.line_nbr
+   AND vs.sched_nbr     = s.sched_nbr
+ 
+  WHERE l.cntrct_id IS NOT NULL and 
+    /* NVL(TRIM(l.cntrct_id),'') <> ''
+    AND*/ l.cancel_status <> 'X'
+    
+  GROUP BY l.cntrct_id
+) ,
+
+cntrct_details as 
+(select setid , 
+cntrct_id,
+cntrct_begin_dt as start_dt,
+cntrct_expire_dt as end_dt,
+ version_nbr AS version_nbr,
+         descr AS descr1,
+         oprid_entered_by AS oprid_entered_by,
+         gross_amt as total_amount
+from ps_cntrct_hdr 
+    where  setid     = 'SHARE'
+    and cntrct_status='A' 
+    and version_status = 'C'   
+    
+)
+
+SELECT 
+  pc.cntrct_id AS "No",
+  ' '          AS "Add_Only",
+  ' '          AS "Supplier_Contract_Reference_For_Updates",
+  pc.cntrct_id AS "Supplier_Contract_ID",
+  ' '          AS "External_System_ID",
+  ' '          AS "External_Contract_Reference_ID",
+  'CO_80800'   AS "Company",
+  ' '          AS "Company_Hierarchy",
+  wd.bh_wd_supplier_id AS "Supplier",
+  ' '          AS "Order_From_Connection",
+  'Y'          AS "Contract_Specialist_Is_Employee",
+  nvl(o.emplid,' ')          AS "Contract_Specialist_ID",
+  'Y'          AS "Buyer_Is_Employee",
+  nvl(o.emplid,' ')           AS "Buyer_ID",
+  'Prepaid Contract'          AS "Contract_Type",
+  'Approved'          AS "Document_Status",
+  h.descr1 AS "Contract_Name",
+  ' ' AS "Contract_Reference",
+  ' '          AS "GPO_Contract_Reference",
+  ' '          AS "Contract_Document_Link",
+  TO_CHAR(h.start_dt,'YYYY-MM-DD') AS "Contract_Start_Date",
+  ' '          AS "Contract_Signed_Date",
+  TO_CHAR(h.end_dt,'YYYY-MM-DD')   AS "Contract_End_Date",
+  ' '          AS "Minimum_Charge_Control_Amount",
+  ' '          AS "Maximum_Charge_Control_Amount",
+ pc.extended_amt          AS "Total_Contract_Amount",
+  ' '          AS "Original_Contract_Amount",
+  pc.currency_cd AS "Currency",
+  ' '          AS "Default_Tax_Code",
+  ' '          AS "Payment_Terms",
+  ' '          AS "Override_Payment_Type",
+  ' '          AS "Credit_Card",
+  ' '          AS "Automatically_Renew",
+  ' '          AS "Send_Expiration_Notification",
+  ' '          AS "Notice_Period",
+  ' '          AS "Notice_Period_Frequency",
+  ' '          AS "Renewal_Term",
+  ' '          AS "Renewal_Term_Frequency",
+  ' '          AS "Contract_Overview",
+  ' '          AS "Locked_in_Workday",
+  ' '          AS "Catalog_Discount_Percent",
+  'CO_80800'          AS "Company_for_Supplier_Invoice",
+  wd.bh_wd_supplier_id          AS "Supplier_for_Supplier_Invoice",
+  ' '          AS "Supplier_Connection_for_Supplier_Invoice",
+  ' '          AS "Use_Default_Supplier_Connection",
+  ' '          AS "Supplier_Invoice_Payment_Terms",
+  ' '          AS "Scheduled_Invoice_Override_Payment_Type",
+  ' '          AS "Supplier_Invoice_Reference_Number",
+  ' '          AS "Company_for_Purchase_Order",
+  ' '          AS "Purchase_Order_Issue_Option",
+  ' '          AS "Purchase_Order_Payment_Terms",
+  ' '          AS "BillTo_Contact_Detail",
+  ' '          AS "BillTo_Address",
+  ' '          AS "ShipTo_Contact_Detail",
+  ' '          AS "ShipTo_Address",
+  'N'          AS "On_Hold",
+  '0'          AS "Percent_to_Retain",
+  ' '          AS "Estimated_Retention_Release_Date",
+  ' '          AS "XMLNAME_3rd_Party_Retention",
+  ' '          AS "Retention_Memo",
+  ' '          AS "Lease_Term",
+  ' '          AS "Compound_Period",
+  ' '          AS "Payment_Frequency",
+  ' '          AS "First_Payment_Installment_Date",
+  ' '          AS "Additional_Payment",
+  ' '          AS "Interest_Rate",
+  ' '          AS "Fixed_Payment_Amount",
+  ' '          AS "Lessor_Incentive",
+  ' '          AS "Initial_Direct_Cost",
+  ' '          AS "Accounting_Method",
+  'Y'          AS "Automatically_Generate_Supplier_Invoice_Schedule_And_Installments",
+  'Y'          AS "Automatically_Generate_Expense_Recognition_Schedule_And_Installments",
+  'EVEN'          AS "Expense_Recognition_Method",
+  ' '          AS "Prepaid_Lease_Payment",
+  ' '          AS "Prepaid_Lease_Payment_Date",
+  ' '          AS "Number_of_Payments",
+  ' '          AS "Total_Interest",
+  ' '          AS "Lease_Liability",
+  ' '          AS "ROU_Asset",
+  ' '          AS "Total_Lease_Payments",
+  ' '          AS "Allow_All_Suppliers",
+  ' '          AS "From_Supplier_List_Only",
+  ' '          AS "Markup_for_All_Suppliers"
+FROM prepaid_contracts pc
+JOIN ps_bh_wd_sup_1to1 wd
+  ON wd.bh_wd_ps_vendor_id = pc.vendor_id
+JOIN cntrct_details h  
+on h.setid='SHARE'
+And h.cntrct_id=pc.cntrct_id
+left join psoprdefn o 
+on o.oprid=h.oprid_entered_by
+ORDER BY pc.cntrct_id

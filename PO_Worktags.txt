@@ -1,54 +1,58 @@
-    
-    
-    WITH base AS (
-      SELECT
-          voucher_id,
-          voucher_line_num,
-          ROW_NUMBER() OVER(
-              PARTITION BY voucher_id, voucher_line_num
-              ORDER BY
-                  CASE field_name
-                      WHEN 'DEPTID' THEN
-                          1
-                      ELSE
-                          2
-                END
-          ) AS row_num,
-          value
-      FROM
-          (
-              SELECT
-                  v.voucher_id,
-                  vl.voucher_line_num,
-                  d.deptid,
-                  d.project_id
-              FROM
-                  ps_voucher        v
-                  JOIN ps_voucher_line   vl ON vl.business_unit = v.business_unit
-                                             AND vl.voucher_id = v.voucher_id
-                  JOIN ps_distrib_line   d ON vl.business_unit = d.business_unit
-                                            AND vl.voucher_id = d.voucher_id
-                                            AND vl.voucher_line_num = d.voucher_line_num
-              WHERE
-                  v.entry_status <> 'X'
-                  AND v.close_status <> 'C'
-          ) UNPIVOT ( value
-              FOR field_name
-          IN ( deptid AS 'DEPTID',
-               project_id AS 'PROJECT_ID' ) )
-      WHERE
-          TRIM(value) IS NOT NULL
-      ORDER BY
-          voucher_id,
-          voucher_line_num,
-          row_num
-  )
+-- Pull worktags (department and project) from voucher distribution lines
+-- We need to unpivot them so each worktag becomes its own row for Workday import
+
+WITH base AS (
   SELECT
-        
-        
+      voucher_id,
+      voucher_line_num,
+      -- Number the worktags so DEPTID comes first, then PROJECT_ID
+      -- This ensures consistent ordering when there are multiple worktags per line
+      ROW_NUMBER() OVER(
+          PARTITION BY voucher_id, voucher_line_num
+          ORDER BY
+              CASE field_name
+                  WHEN 'DEPTID' THEN
+                      1
+                  ELSE
+                      2
+            END
+      ) AS row_num,
+      value
+  FROM
+      (
+          -- Get the department and project from distribution lines
+          -- Only looking at active vouchers (not cancelled or closed)
+          SELECT
+              v.voucher_id,
+              vl.voucher_line_num,
+              d.deptid,
+              d.project_id
+          FROM
+              ps_voucher        v
+              JOIN ps_voucher_line   vl ON vl.business_unit = v.business_unit
+                                         AND vl.voucher_id = v.voucher_id
+              JOIN ps_distrib_line   d ON vl.business_unit = d.business_unit
+                                        AND vl.voucher_id = d.voucher_id
+                                        AND vl.voucher_line_num = d.voucher_line_num
+          WHERE
+              v.entry_status <> 'X'
+              AND v.close_status <> 'C'
+      ) UNPIVOT ( value
+          FOR field_name
+      IN ( deptid AS 'DEPTID',
+           project_id AS 'PROJECT_ID' ) )
+  WHERE
+      -- Skip any null or empty worktag values
+      TRIM(value) IS NOT NULL
+  ORDER BY
+      voucher_id,
+      voucher_line_num,
+      row_num
+)
+SELECT
       b.voucher_id      AS "*No.",
       b.voucher_line_num   AS "*Invoice Line Replacement Data Line No",
       b.row_num    AS "*Invoice Line Worktags Line No",
       b.value      AS "Worktags"
-  FROM
-      base b
+FROM
+    base b
