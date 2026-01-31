@@ -1,0 +1,7 @@
+enabled,sql_path,file_type,duckdb_table,output_csv
+1,C:\PT8.61.09_Client_ORA\python\PO\PO_Header.sql,PO_HEADER,po_header,
+1,C:\PT8.61.09_Client_ORA\python\PO\Goods_PO_Line.sql,GOODS_PO_LINE,goods_po_line,
+1,C:\PT8.61.09_Client_ORA\python\PO\Service_PO_Line.sql,SERVICE_PO_LINE,service_po_line,
+1,C:\PT8.61.09_Client_ORA\python\PO\PO_Worktags_lookback12.sql,PO_WORKTAGS,po_worktags_lookback12,
+1,C:\PT8.61.09_Client_ORA\python\PO\Service_Line_WorkTags.sql,SERVICE_LINE_WORKTAGS,service_line_worktags,
+1,C:\PT8.61.09_Client_ORA\python\Supplier_Invoice_Adjustment\Supplier_Invoice_Adjustment.sql,Supplier_Invoice_Adjustment,supplier_invoice_adjustment,

@@ -158,3 +158,76 @@ If your environment requires Oracle Instant Client (thick mode), install Instant
 - Backtick `` ` `` is PowerShell’s line continuation (must be the last character on the line).
 - If you prefer single-line commands, just remove the backticks and newlines.
 
+---
+
+## 7) Run Oracle extracts into DuckDB (single SQL)
+
+This is the pattern you posted (one SQL → CSV + DuckDB table):
+
+```powershell
+cd C:\PT8.61.09_Client_ORA\python
+
+.\python oracle_extract.py `
+  "C:\PT8.61.09_Client_ORA\python\Supplier_Invoice_Adjustment\Supplier_Invoice_Adjustment.sql" `
+  -u "<USER>" `
+  -p "<PASSWORD>" `
+  -c "vms-00-00-773.bhsi.com:1521/ERPWD1" `
+  --file-type "Supplier_Invoice_Adjustment" `
+  --duckdb "C:\PT8.61.09_Client_ORA\python\PO\extracts.duckdb"
+```
+
+### What gets created where
+
+- **CSV**: by default, written next to the `.sql` file as `Supplier_Invoice_Adjustment.csv`
+- **DuckDB table**: by default, derived from SQL filename and sanitized to lowercase underscores:
+  - `Supplier_Invoice_Adjustment.sql` → DuckDB table `supplier_invoice_adjustment`
+- **Headers**: `--file-type X` makes the extractor look for `headers_X.txt` or `headers_X.csv` **in the same folder as the `.sql` file**.
+  - If not found, it prints a warning and continues using the raw Oracle column names.
+
+### Quick verify (table exists + rowcount)
+
+```powershell
+.\python -c "import duckdb; con=duckdb.connect(r'C:\PT8.61.09_Client_ORA\python\PO\extracts.duckdb', read_only=True); print(con.execute('select count(*) from supplier_invoice_adjustment').fetchone()); con.close()"
+```
+
+---
+
+## 8) Run ALL Oracle extract SQLs (batch / unattended)
+
+Use the batch runner script:
+
+- `bh_oracle_extracts\run_all_oracle_extracts.ps1`
+
+### Step A: Create a manifest CSV
+
+Start from:
+
+- `bh_oracle_extracts\extract_manifest_example.csv`
+
+Copy it to your local `C:\PT8.61.09_Client_ORA\python\PO\extract_manifest.csv` and edit the SQL paths + file types.
+
+### Step B: Run the batch
+
+```powershell
+cd C:\PT8.61.09_Client_ORA\python
+
+.\bh_oracle_extracts\run_all_oracle_extracts.ps1 `
+  -PythonExe ".\python" `
+  -OracleExtractPy ".\oracle_extract.py" `
+  -OracleUser "<USER>" `
+  -OraclePassword "<PASSWORD>" `
+  -OracleConnect "vms-00-00-773.bhsi.com:1521/ERPWD1" `
+  -DuckDB "C:\PT8.61.09_Client_ORA\python\PO\extracts.duckdb" `
+  -ManifestCsv ".\PO\extract_manifest.csv" `
+  -ArraySize 50000 `
+  -FetchSize 50000 `
+  -ExcelBom `
+  -QuoteAll
+```
+
+### Output behavior
+
+- Each SQL produces its own CSV (unless you set `output_csv` in the manifest).
+- Each SQL creates/replaces a DuckDB table (name from `duckdb_table` if set; else derived from SQL filename).
+
+
