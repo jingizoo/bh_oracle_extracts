@@ -1,3 +1,8 @@
+/* PO Header extract for Workday:
+   - Uses open‑PO logic based on receipts, vouchers, and PO status to find active POs in a 12‑month window
+   - Classifies POs (supplies, inventory, service, bill‑only, etc.) and aggregates comments and procedure info
+   - Outputs one row per PO header in the Workday header layout with all required header‑level attributes */
+
 WITH params AS (
   SELECT TRUNC(to_date('15-01-2026','DD-MM-YYYY')) AS asof_dt,
          ADD_MONTHS(TRUNC(To_date('15-01-2026','DD-MM-YYYY')), -12) AS lookback_dt

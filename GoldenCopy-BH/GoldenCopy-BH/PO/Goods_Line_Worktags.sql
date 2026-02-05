@@ -1,3 +1,8 @@
+/* Goods PO Line worktags for Workday:
+   - Reuses the open‑goods‑PO line population from the goods line extract
+   - Picks one best distribution per line and derives cost center / project worktags
+   - Outputs one or more worktag rows per goods PO line in the Workday layout */
+
 WITH params AS (
     SELECT
         TRUNC(TO_DATE('15-01-2026','DD-MM-YYYY')) AS asof_dt,

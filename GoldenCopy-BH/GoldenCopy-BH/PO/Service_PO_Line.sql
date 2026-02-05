@@ -1,3 +1,8 @@
+/* Service PO Line extract for Workday:
+   - Builds a 12‑month “open service PO” population using matched + paid voucher activity and PO status
+   - Filters for service POs and computes remaining amounts at the PO line/schedule level
+   - Outputs one row per qualifying service PO line in the Workday layout */
+
 WITH
 params AS (
   SELECT TRUNC(to_date('15-01-2026','DD-MM-YYYY')) AS asof_dt,

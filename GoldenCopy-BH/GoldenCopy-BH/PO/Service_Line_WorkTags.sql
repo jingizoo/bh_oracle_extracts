@@ -1,3 +1,8 @@
+/* Service PO Line worktags for Workday:
+   - Reuses the open‑service‑PO line population from the service line extract
+   - Picks distributions and derives cost center / project / fund worktags for each line
+   - Outputs one or more worktag rows per service PO line in the Workday layout */
+
 WITH
 params AS (
   SELECT TRUNC(to_date('15-01-2026','DD-MM-YYYY')) AS asof_dt,
