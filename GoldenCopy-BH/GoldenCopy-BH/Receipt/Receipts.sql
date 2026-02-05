@@ -1,5 +1,9 @@
 
 
+/* Receipt Header extract for Workday:
+   - Uses the same open‚ÄëPO logic as the item receipt line query to identify qualifying receipts
+   - Aggregates receipt ship and distribution data up to the receiver header level
+   - Outputs one row per open receipt header in the Workday ‚ÄúReceipts‚Äù layout */
 
 WITH params AS (
   SELECT TRUNC(to_date('15-01-2026','DD-MM-YYYY')) AS asof_dt,
@@ -465,7 +469,7 @@ vchr_sum_match_ship AS (
     r.recv_ln_nbr,
     r.recv_ship_seq_nbr,
 
-    /* FIFO allocated portion of ìunmappedî paid qty */
+    /* FIFO allocated portion of ÔøΩunmappedÔøΩ paid qty */
     LEAST(
       r.qty_rcvd_unmapped,
       GREATEST(
@@ -487,7 +491,7 @@ vchr_sum_match_ship AS (
   FROM rcv_ship_ranked r
 ),
 
-/* 5) Qualifying receipt schedules ó now correctly at ship-line grain */
+/* 5) Qualifying receipt schedules ÔøΩ now correctly at ship-line grain */
 qual_ship AS (
   SELECT
     rls.business_unit,

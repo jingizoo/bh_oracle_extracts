@@ -1,4 +1,8 @@
 
+/* Item Receipt Line extract for Workday:
+   - Finds open POs and schedules using voucher/receipt activity (aligned with PO header logic)
+   - Allocates matched & paid voucher quantities down to individual receipt ship lines
+   - Outputs one row per qualifying receipt line in the Workday “Item Receipt Line” layout */
 
 WITH params AS (
   SELECT TRUNC(to_date('15-01-2026','DD-MM-YYYY')) AS asof_dt,
@@ -409,7 +413,7 @@ vchr_sum_match_ship AS (
     r.recv_ln_nbr,
     r.recv_ship_seq_nbr,
 
-    /* FIFO allocated portion of “unmapped�? paid qty */
+    /* FIFO allocated portion of “unmapped�? paid qty */
     LEAST(
       r.qty_rcvd_unmapped,
       GREATEST(
